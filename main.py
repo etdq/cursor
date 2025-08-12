@@ -461,7 +461,7 @@ def wait_for_http_response(uid: str, timeout_seconds: int = 15):
 
 
 def c2_console():
-    global current_session
+    global current_session, line_mode_shell_id
     list_map = {}
     print("\n[*] C2 Console Started. Type 'help' for commands.")
     while True:
@@ -594,12 +594,8 @@ def c2_console():
                 if current_session and current_session[0] == 'shell':
                     print(f"\n[*] Disengaging from shell {current_session[1]}. Type 'list' to see sessions.")
                     current_session = None
-                    # Clear line-mode if active
-                    if line_mode_shell_id is not None:
-                        # Leaving line mode
-                        pass
-                    # Reset flag
-                    globals().update({"line_mode_shell_id": None})
+                    # Reset line-mode flag if active
+                    line_mode_shell_id = None
                     continue
             print("\n[*] Keyboard interrupt received, exiting.")
             sys.exit(0)
