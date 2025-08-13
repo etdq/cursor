@@ -601,9 +601,9 @@ def c2_console():
                                 verify_cmd = None
                                 if OS_CHOICE == "Windows":
                                     verify_cmd = (
-                                        f"$ErrorActionPreference='SilentlyContinue';"
+                                        "$ErrorActionPreference='SilentlyContinue';"
                                         f"Set-Location -Path \"{target_dir}\";"
-                                        f"if($?){{Write-Output \"CWD:\" + (Get-Location).Path}}else{{Write-Output \"CDERR\"}}"
+                                        "if($?){Write-Output \"CWD:\" + (Get-Location).Path}else{Write-Output \"CDERR\"}"
                                     )
                                 else:
                                     # Generic POSIX fallback
