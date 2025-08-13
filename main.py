@@ -691,21 +691,45 @@ def main():
     tcp_port = None
 
     if os_choice == "Windows":
-        # Ask only for HTTP port for Windows payloads
+        # Ask only for HTTP port for Windows payloads; set default TCP 4444
         while True:
-            http_port = ask_port("Enter HTTP listener port (1-65535): ")
+            http_port = ask_port("Enter HTTP listener port (1-65535) [Linux TCP will default to 4444]: ")
             if not can_bind(lhost, http_port):
                 print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
                 continue
             break
+        # Assign default TCP for Linux side
+        tcp_port = 4444
+        if not can_bind(lhost, tcp_port):
+            print(f"[!] Default TCP 4444 unavailable on {lhost}.")
+            while True:
+                tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
+                if not can_bind(lhost, tcp_port):
+                    print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
+                    continue
+                break
+        else:
+            print(f"[*] Using default TCP port {tcp_port} for Linux listener.")
     else:
-        # Ask only for TCP port for Linux payloads
+        # Ask only for TCP port for Linux payloads; set default HTTP 2222
         while True:
-            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
+            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535) [Windows HTTP will default to 2222]: ")
             if not can_bind(lhost, tcp_port):
                 print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
                 continue
             break
+        # Assign default HTTP for Windows side
+        http_port = 2222
+        if not can_bind(lhost, http_port):
+            print(f"[!] Default HTTP 2222 unavailable on {lhost}.")
+            while True:
+                http_port = ask_port("Enter HTTP listener port (1-65535): ")
+                if not can_bind(lhost, http_port):
+                    print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
+                    continue
+                break
+        else:
+            print(f"[*] Using default HTTP port {http_port} for Windows listener.")
 
     # load payload module (linux/windows) and list keys
     module = load_payload_module(os_choice)
@@ -737,22 +761,13 @@ def main():
     global OS_CHOICE
     OS_CHOICE = os_choice
 
-    # start only the relevant listeners
+    # start both listeners
     try:
-        if HTTP_PORT:
-            threading.Thread(target=run_http_server, daemon=True).start()
-            threading.Thread(target=monitor_http_implants, daemon=True).start()
-        if RAW_TCP_PORT:
-            threading.Thread(target=run_raw_tcp_server, daemon=True).start()
+        threading.Thread(target=run_http_server, daemon=True).start()
+        threading.Thread(target=monitor_http_implants, daemon=True).start()
+        threading.Thread(target=run_raw_tcp_server, daemon=True).start()
         time.sleep(0.5)
-        if HTTP_PORT and RAW_TCP_PORT:
-            print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
-        elif HTTP_PORT:
-            print(f"\n[*] Listener started on {HOST} (HTTP: {HTTP_PORT}).")
-        elif RAW_TCP_PORT:
-            print(f"\n[*] Listener started on {HOST} (TCP: {RAW_TCP_PORT}).")
-        else:
-            print("[!] No listeners started.")
+        print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
         # Enter C2 console (blocking)
         c2_console()
     except Exception as e:
