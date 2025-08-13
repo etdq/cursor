@@ -342,6 +342,12 @@ def interactive_shell_session(shell_id: int):
         old_settings = None
 
     print(f"[+] Interacting with shell {shell_id}. Press Ctrl-] to return to C2 console.")
+    # Ensure the cursor is at the start of a new line in raw mode
+    try:
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
     interactive_shell_active_for_id = shell_id
     current_session = ('shell', shell_id)
 
@@ -365,8 +371,16 @@ def interactive_shell_session(shell_id: int):
                             if current_session == ('shell', shell_id):
                                 current_session = None
                         return
-                    sys.stdout.write(data.decode(errors='ignore'))
-                    sys.stdout.flush()
+                    # Normalize LF to CRLF in raw mode to avoid diagonal output
+                    try:
+                        text = data.decode(errors='ignore')
+                    except Exception:
+                        text = ''
+                    if text:
+                        text = text.replace('\r\n', '\n')
+                        text = text.replace('\n', '\r\n')
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
                 else:
                     # stdin (read as much as available)
                     try:
