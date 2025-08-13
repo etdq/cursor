@@ -353,6 +353,11 @@ def interactive_shell_session(shell_id: int):
 
     try:
         shell_socket.setblocking(False)
+        # Proactively request a prompt from remote shell
+        try:
+            shell_socket.sendall(b'echo -n "${PS1:-$ }"\n')
+        except Exception:
+            pass
         while True:
             rlist = [shell_socket, fd]
             ready, _, _ = select(rlist, [], [], 0.1)
@@ -389,6 +394,19 @@ def interactive_shell_session(shell_id: int):
                         buf = b''
                     if not buf:
                         continue
+                    # Local echo for better UX
+                    try:
+                        for b in buf:
+                            if b in (8, 127):
+                                sys.stdout.write('\b \b')
+                            elif b == 13:  # CR
+                                sys.stdout.write('\r\n')
+                            elif b == 9 or 32 <= b < 127:  # tab or printable
+                                sys.stdout.write(chr(b))
+                            # ignore other control characters
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
                     # Handle Ctrl-] (0x1d) to exit
                     if b'\x1d' in buf:
                         cut = buf.split(b'\x1d', 1)[0]
