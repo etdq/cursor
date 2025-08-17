@@ -176,6 +176,25 @@ def save_custom_payload(os_choice: str, name: str, template: str, connection: st
         json.dump(current, f, indent=2)
 
 
+def read_payload_source(maybe_path: str) -> str:
+    """Return file contents if maybe_path points to a readable file (supports @file), else return the string itself."""
+    if not isinstance(maybe_path, str) or not maybe_path.strip():
+        return maybe_path
+    candidate = maybe_path.strip()
+    if candidate.startswith("@"):
+        candidate = candidate[1:].strip()
+    expanded = os.path.expanduser(candidate)
+    try_paths = [expanded, os.path.abspath(expanded)]
+    for p in try_paths:
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+        except Exception:
+            pass
+    return maybe_path
+
+
 def template_payload_content(raw: str, lhost: str, lport: int) -> str:
     try:
         port_str = str(lport)
@@ -195,7 +214,7 @@ def template_payload_content(raw: str, lhost: str, lport: int) -> str:
         #    - after ',' allowing optional whitespace (argument lists)
         out = re.sub(rf'(?<=,)\s*{port_re}(?!\d)', '{LPORT}', out)
         #    - quoted numbers
-        out = re.sub(rf'([\"\"])\s*{port_re}\s*([\"\"])', r'\1{LPORT}\2', out)
+        out = re.sub(rf'(["\"])\s*{port_re}\s*(["\"])', r'\1{LPORT}\2', out)
         #    - standalone numeric token
         out = re.sub(rf'(?<!\d){port_re}(?!\d)', '{LPORT}', out)
 
@@ -896,7 +915,7 @@ def main():
                 sys.exit(2)
 
             # Template the provided payload content robustly
-            raw = args.payload
+            raw = read_payload_source(args.payload)
             templated = template_payload_content(raw, args.lhost, args.lport)
             save_custom_payload(os_choice, args.name, templated, connection)
             print(f"[+] Stored payload '{args.name}' for {os_choice} ({connection}).")
@@ -1009,9 +1028,11 @@ def main():
                 print("[!] Name cannot be empty.")
         pay_content = ""
         while not pay_content:
-            pay_content = input("Enter payload content (use your real host:port; they will be templated): ").strip()
-            if not pay_content:
+            src = input("Enter payload content OR @/path/to/file: ").strip()
+            if not src:
                 print("[!] Payload content cannot be empty.")
+                continue
+            pay_content = read_payload_source(src)
         templated = template_payload_content(pay_content, lhost, lport)
         save_custom_payload(os_choice, name, templated, connection)
         print(f"[+] Stored payload '{name}' for {os_choice} ({connection}).")
