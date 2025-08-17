@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 from select import select
+import os
+import json
 
 # external deps
 from colorama import Fore, Style, init as colorama_init
@@ -119,14 +121,42 @@ def load_payload_module(os_choice: str):
         raise ImportError(f"Failed to load payload module for {os_choice}: {e}")
 
 
-def generate_payload_text(module, payload_key: str, lhost: str, lport: int) -> str:
+def generate_payload_text(template: str, lhost: str, lport: int) -> str:
     """Replace placeholders in template with LHOST/LPORT and return final payload string."""
-    if payload_key not in module.payloads:
-        raise KeyError(f"Payload '{payload_key}' not found in module.")
-    template = module.payloads[payload_key]
-    # replace both placeholders robustly
-    payload = template.replace("{LHOST}", lhost).replace("{LPORT}", str(lport))
-    return payload
+    return template.replace("{LHOST}", lhost).replace("{LPORT}", str(lport))
+
+
+def load_custom_payloads(os_choice: str) -> dict:
+    """Load custom payloads JSON for given OS, returning dict keyed by name to {template, transport}."""
+    path = os.path.join(os.path.dirname(__file__), "payloads", f"custom_{os_choice.lower()}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_custom_payload(os_choice: str, name: str, template: str, transport: str) -> None:
+    """Persist a custom payload to custom_<os>.json safely."""
+    path = os.path.join(os.path.dirname(__file__), "payloads", f"custom_{os_choice.lower()}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+        except Exception:
+            pass
+    data[name] = {"template": template, "transport": transport}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 # -----------------------
@@ -699,21 +729,38 @@ def main():
     # choose OS first
     os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
 
+    # optionally allow user to add a custom payload first
+    add_custom = ask_choice("Add a custom payload before generating? (y/N): ", ["y", "n", "Y", "N"]).lower()
+    if add_custom == "y":
+        name = input("Enter a unique payload name: ").strip()
+        transport = ask_choice("Transport (TCP/HTTP): ", ["TCP", "HTTP"]).lower()
+        print("Paste the payload template below. Use {LHOST} and {LPORT} placeholders:")
+        template = input("> ")
+        # basic validation
+        if "{LHOST}" not in template or "{LPORT}" not in template:
+            print("[!] Template must include {LHOST} and {LPORT}. Skipping save.")
+        else:
+            save_custom_payload(os_choice, name, template, transport)
+            print(f"[+] Saved custom {os_choice} payload '{name}' ({transport}).")
+
     # get LHOST
     lhost = ask_ip("Enter LHOST (IPv4) to bind listeners and inject into payload: ")
 
+    # ask transport independently of OS
+    transport_choice = ask_choice("Transport to use (TCP/HTTP): ", ["TCP", "HTTP"]).lower()
+
+    # ports setup: always ask for chosen transport; set reasonable default for the other
     http_port = None
     tcp_port = None
 
-    if os_choice == "Windows":
-        # Ask only for HTTP port for Windows payloads; set default TCP 4444
+    if transport_choice == "http":
         while True:
-            http_port = ask_port("Enter HTTP listener port (1-65535) [Linux TCP will default to 4444]: ")
+            http_port = ask_port("Enter HTTP listener port (1-65535) [default TCP will be 4444]: ")
             if not can_bind(lhost, http_port):
                 print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
                 continue
             break
-        # Assign default TCP for Linux side
+        # set default TCP
         tcp_port = 4444
         if not can_bind(lhost, tcp_port):
             print(f"[!] Default TCP 4444 unavailable on {lhost}.")
@@ -724,16 +771,15 @@ def main():
                     continue
                 break
         else:
-            print(f"[*] Using default TCP port {tcp_port} for Linux listener.")
+            print(f"[*] Using default TCP port {tcp_port}.")
     else:
-        # Ask only for TCP port for Linux payloads; set default HTTP 2222
         while True:
-            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535) [Windows HTTP will default to 2222]: ")
+            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535) [default HTTP will be 2222]: ")
             if not can_bind(lhost, tcp_port):
                 print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
                 continue
             break
-        # Assign default HTTP for Windows side
+        # set default HTTP
         http_port = 2222
         if not can_bind(lhost, http_port):
             print(f"[!] Default HTTP 2222 unavailable on {lhost}.")
@@ -744,20 +790,37 @@ def main():
                     continue
                 break
         else:
-            print(f"[*] Using default HTTP port {http_port} for Windows listener.")
+            print(f"[*] Using default HTTP port {http_port}.")
 
-    # load payload module (linux/windows) and list keys
+    # load builtin and custom payloads then filter by transport
     module = load_payload_module(os_choice)
-    keys = list(module.payloads.keys())
+    builtin = module.payloads  # values are {template, transport}
+    custom = load_custom_payloads(os_choice)
+
+    combined = {}
+    for name, meta in builtin.items():
+        if isinstance(meta, dict) and meta.get("transport") in ("tcp", "http"):
+            combined[name] = meta
+    for name, meta in custom.items():
+        if isinstance(meta, dict) and meta.get("transport") in ("tcp", "http"):
+            combined[name] = meta
+
+    wanted_transport = transport_choice
+    keys = [k for k, v in combined.items() if v.get("transport") == wanted_transport]
+
+    if not keys:
+        print(f"[!] No {wanted_transport.upper()} payloads available for {os_choice}.")
+        sys.exit(1)
+
     print("\nAvailable payloads:")
     for k in keys:
         print(" -", k)
 
     payload_key = ask_choice("Select payload (type exact key): ", keys)
 
-    # generate payload using the relevant port for the selected OS
-    selected_port = tcp_port if os_choice == "Linux" else http_port
-    payload_text = generate_payload_text(module, payload_key, lhost, selected_port)
+    template = combined[payload_key]["template"]
+    selected_port = tcp_port if wanted_transport == "tcp" else http_port
+    payload_text = generate_payload_text(template, lhost, selected_port)
 
     # display and copy
     print("\n[+] Generated payload (copied to clipboard):\n")
