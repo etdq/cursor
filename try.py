@@ -182,15 +182,40 @@ def template_payload_content(raw: str, lhost: str, lport: int) -> str:
         host_re = re.escape(lhost)
         port_re = re.escape(port_str)
         out = raw
-        # Replace host+port occurrences first (e.g., 10.0.0.1:4444 or 10.0.0.1/4444)
+        # 1) Replace host+port occurrences first (e.g., 10.0.0.1:4444 or 10.0.0.1/4444)
         out = re.sub(rf'({host_re})(:|/){port_re}', r'{LHOST}\2{LPORT}', out)
-        # Replace standalone host
+        # 2) Replace standalone host (constants) with placeholder
         out = re.sub(host_re, '{LHOST}', out)
-        # Replace port in common contexts (after :, /, =, or as a standalone number)
+        # 3) Replace port in common explicit contexts using the provided lport
+        #    - after ':' or '/'
         out = re.sub(rf'(?<=:){port_re}(?!\d)', '{LPORT}', out)
         out = re.sub(rf'(?<=/){port_re}(?!\d)', '{LPORT}', out)
-        out = re.sub(rf'(?<==){port_re}(?!\d)', '{LPORT}', out)
+        #    - after '=' allowing optional whitespace (keep '=')
+        out = re.sub(rf'(=)\s*{port_re}(?!\d)', r'\1{LPORT}', out)
+        #    - after ',' allowing optional whitespace (argument lists)
+        out = re.sub(rf'(?<=,)\s*{port_re}(?!\d)', '{LPORT}', out)
+        #    - quoted numbers
+        out = re.sub(rf'([\"\"])\s*{port_re}\s*([\"\"])', r'\1{LPORT}\2', out)
+        #    - standalone numeric token
         out = re.sub(rf'(?<!\d){port_re}(?!\d)', '{LPORT}', out)
+
+        # 4) Heuristic replacements if no {LPORT} yet (cover hard-coded ports not matching user-provided lport)
+        if '{LPORT}' not in out:
+            # a) PowerShell-style: $LPORT = 4444
+            out = re.sub(r'(\$LPORT\s*=\s*)\d{1,5}', r'\1{LPORT}', out)
+        if '{LPORT}' not in out:
+            # b) TCPClient(host, 4444)
+            out = re.sub(r'(?i)(TCPClient\([^,]+,\s*)\d{1,5}', r'\1{LPORT}', out)
+        if '{LPORT}' not in out:
+            # c) After {LHOST} or $LHOST separated by comma
+            out = re.sub(r'(\{LHOST\}|\$LHOST)\s*,\s*\d{1,5}', r'\1,{LPORT}', out)
+        if '{LPORT}' not in out:
+            # d) {LHOST}:4444 or {LHOST}/4444
+            out = re.sub(r'(\{LHOST\})(:|/)\d{1,5}', r'\1\2{LPORT}', out)
+        if '{LPORT}' not in out:
+            # e) Netcat-like: "... {LHOST} 4444 ..."
+            out = re.sub(r'(\{LHOST\})\s+\d{1,5}', r'\1 {LPORT}', out)
+
         return out
     except Exception:
         # Fallback (naive) replacement

