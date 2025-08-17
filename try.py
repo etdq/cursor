@@ -914,6 +914,16 @@ def main():
                 print("[!] In create mode, -pay (payload content) is required.")
                 sys.exit(2)
 
+            # Ensure unique payload name across built-ins and custom store
+            try:
+                builtin_names = set(getattr(load_payload_module(os_choice), "payloads", {}).keys())
+            except Exception:
+                builtin_names = set()
+            custom_names = set(load_custom_payloads(os_choice).keys())
+            if args.name in builtin_names or args.name in custom_names:
+                print(f"[!] Payload name '{args.name}' already exists. Choose a different name.")
+                sys.exit(2)
+
             # Template the provided payload content robustly
             raw = read_payload_source(args.payload)
             templated = template_payload_content(raw, args.lhost, args.lport)
@@ -1022,10 +1032,20 @@ def main():
         lhost = ask_ip("Enter LHOST (IPv4): ")
         lport = ask_port("Enter LPORT (1-65535): ")
         name = ""
-        while not name:
+        while True:
             name = input("Enter payload name: ").strip()
             if not name:
                 print("[!] Name cannot be empty.")
+                continue
+            try:
+                builtin_names = set(getattr(load_payload_module(os_choice), "payloads", {}).keys())
+            except Exception:
+                builtin_names = set()
+            custom_names = set(load_custom_payloads(os_choice).keys())
+            if name in builtin_names or name in custom_names:
+                print("[!] A payload with this name already exists. Choose a different name.")
+                continue
+            break
         pay_content = ""
         while not pay_content:
             src = input("Enter payload content OR @/path/to/file: ").strip()
