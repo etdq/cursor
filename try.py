@@ -195,6 +195,85 @@ def read_payload_source(maybe_path: str) -> str:
     return maybe_path
 
 
+def extract_host_port(payload_text: str) -> tuple[str | None, int | None]:
+    """Best-effort extraction of host and port from payload text.
+    Prefers IPv4 candidates. Returns (host, port) or (None, None) if not found.
+    """
+    if not isinstance(payload_text, str) or not payload_text:
+        return (None, None)
+    text = payload_text
+    host_port_pairs: list[tuple[str, int]] = []
+    hosts: list[str] = []
+    ports: list[int] = []
+
+    def add_pair(h: str, p: str | int):
+        try:
+            pi = int(p)
+            if 1 <= pi <= 65535:
+                host_port_pairs.append((h, pi))
+        except Exception:
+            return
+
+    # /dev/tcp/HOST/PORT
+    for h, p in re.findall(r"/dev/tcp/([A-Za-z0-9\-.]+)/([0-9]{1,5})", text):
+        add_pair(h, p)
+
+    # TCPClient('HOST', PORT)
+    for h, p in re.findall(r"(?i)TCPClient\(\s*['\"]([^'\"]+)['\"]\s*,\s*([0-9]{1,5})\s*\)", text):
+        add_pair(h, p)
+
+    # Generic HOST:PORT (includes $s='host:port')
+    for h, p in re.findall(r"\b([A-Za-z0-9\-.]+)\s*:\s*([0-9]{1,5})\b", text):
+        add_pair(h, p)
+
+    # HTTP URLs
+    for h, p in re.findall(r"(?i)https?://([A-Za-z0-9\-.]+)(?::([0-9]{1,5}))?", text):
+        if p:
+            add_pair(h, p)
+        else:
+            hosts.append(h)
+
+    # nc host port
+    for h, p in re.findall(r"(?i)\bnc(?:at)?\b[^\n]*?\s([A-Za-z0-9\-.]+)\s+([0-9]{1,5})\b", text):
+        add_pair(h, p)
+
+    # Assignments
+    for h in re.findall(r"\$LHOST\s*=\s*['\"]([^'\"]+)['\"]", text):
+        hosts.append(h)
+    for p in re.findall(r"\$LPORT\s*=\s*([0-9]{1,5})\b", text):
+        try:
+            ports.append(int(p))
+        except Exception:
+            pass
+
+    # Choose host
+    chosen_host = None
+    # Prefer host from pairs that is IPv4
+    for h, _ in host_port_pairs:
+        if is_valid_ipv4(h):
+            chosen_host = h
+            break
+    if chosen_host is None:
+        # Next, any IPv4 from hosts list
+        for h in hosts:
+            if is_valid_ipv4(h):
+                chosen_host = h
+                break
+    if chosen_host is None and host_port_pairs:
+        chosen_host = host_port_pairs[0][0]
+    if chosen_host is None and hosts:
+        chosen_host = hosts[0]
+
+    # Choose port
+    chosen_port = None
+    if host_port_pairs:
+        chosen_port = host_port_pairs[0][1]
+    if chosen_port is None and ports:
+        chosen_port = ports[0]
+
+    return (chosen_host, chosen_port)
+
+
 def template_payload_content(raw: str, lhost: str, lport: int) -> str:
     try:
         port_str = str(lport)
@@ -901,12 +980,6 @@ def main():
             if connection not in ("http", "tcp"):
                 print("[!] In create mode, -con must be 'http' or 'tcp'.")
                 sys.exit(2)
-            if not (args.lhost and is_valid_ipv4(args.lhost)):
-                print("[!] In create mode, a valid -lhost is required.")
-                sys.exit(2)
-            if not (args.lport and 1 <= args.lport <= 65535):
-                print("[!] In create mode, a valid -lport (1-65535) is required.")
-                sys.exit(2)
             if not args.name:
                 print("[!] In create mode, -n (payload name) is required.")
                 sys.exit(2)
@@ -924,9 +997,13 @@ def main():
                 print(f"[!] Payload name '{args.name}' already exists. Choose a different name.")
                 sys.exit(2)
 
-            # Template the provided payload content robustly
+            # Load and auto-extract host/port from payload
             raw = read_payload_source(args.payload)
-            templated = template_payload_content(raw, args.lhost, args.lport)
+            ex_host, ex_port = extract_host_port(raw)
+            if not ex_host or not ex_port:
+                print("[!] Could not auto-detect LHOST/LPORT from payload. Please include a host:port or TCPClient('host',port), etc.")
+                sys.exit(2)
+            templated = template_payload_content(raw, ex_host, ex_port)
             save_custom_payload(os_choice, args.name, templated, connection)
             print(f"[+] Stored payload '{args.name}' for {os_choice} ({connection}).")
             sys.exit(0)
@@ -1029,8 +1106,6 @@ def main():
     if mode_choice == "Store":
         os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
         connection = ask_choice("Connection type (tcp/http): ", ["tcp", "http"])
-        lhost = ask_ip("Enter LHOST (IPv4): ")
-        lport = ask_port("Enter LPORT (1-65535): ")
         name = ""
         while True:
             name = input("Enter payload name: ").strip()
@@ -1053,7 +1128,11 @@ def main():
                 print("[!] Payload content cannot be empty.")
                 continue
             pay_content = read_payload_source(src)
-        templated = template_payload_content(pay_content, lhost, lport)
+        ex_host, ex_port = extract_host_port(pay_content)
+        if not ex_host or not ex_port:
+            print("[!] Could not auto-detect LHOST/LPORT from payload. Include host and port (e.g., host:port or TCPClient('host',port)).")
+            sys.exit(2)
+        templated = template_payload_content(pay_content, ex_host, ex_port)
         save_custom_payload(os_choice, name, templated, connection)
         print(f"[+] Stored payload '{name}' for {os_choice} ({connection}).")
         sys.exit(0)
