@@ -176,6 +176,27 @@ def save_custom_payload(os_choice: str, name: str, template: str, connection: st
         json.dump(current, f, indent=2)
 
 
+def template_payload_content(raw: str, lhost: str, lport: int) -> str:
+    try:
+        port_str = str(lport)
+        host_re = re.escape(lhost)
+        port_re = re.escape(port_str)
+        out = raw
+        # Replace host+port occurrences first (e.g., 10.0.0.1:4444 or 10.0.0.1/4444)
+        out = re.sub(rf'({host_re})(:|/){port_re}', r'{LHOST}\2{LPORT}', out)
+        # Replace standalone host
+        out = re.sub(host_re, '{LHOST}', out)
+        # Replace port in common contexts (after :, /, =, or as a standalone number)
+        out = re.sub(rf'(?<=:){port_re}(?!\d)', '{LPORT}', out)
+        out = re.sub(rf'(?<=/){port_re}(?!\d)', '{LPORT}', out)
+        out = re.sub(rf'(?<==){port_re}(?!\d)', '{LPORT}', out)
+        out = re.sub(rf'(?<!\d){port_re}(?!\d)', '{LPORT}', out)
+        return out
+    except Exception:
+        # Fallback (naive) replacement
+        return raw.replace(lhost, '{LHOST}').replace(str(lport), '{LPORT}')
+
+
 def infer_connection_type_from_template(template: str) -> str:
     """Best-effort inference: return 'http' if HTTP indicators present else 'tcp'."""
     low = (template or "").lower()
@@ -849,10 +870,9 @@ def main():
                 print("[!] In create mode, -pay (payload content) is required.")
                 sys.exit(2)
 
-            # Template the provided payload content: replace the concrete host/port with placeholders
+            # Template the provided payload content robustly
             raw = args.payload
-            templated = raw.replace(str(args.lhost), "{LHOST}")
-            templated = templated.replace(str(args.lport), "{LPORT}")
+            templated = template_payload_content(raw, args.lhost, args.lport)
             save_custom_payload(os_choice, args.name, templated, connection)
             print(f"[+] Stored payload '{args.name}' for {os_choice} ({connection}).")
             sys.exit(0)
@@ -967,7 +987,7 @@ def main():
             pay_content = input("Enter payload content (use your real host:port; they will be templated): ").strip()
             if not pay_content:
                 print("[!] Payload content cannot be empty.")
-        templated = pay_content.replace(str(lhost), "{LHOST}").replace(str(lport), "{LPORT}")
+        templated = template_payload_content(pay_content, lhost, lport)
         save_custom_payload(os_choice, name, templated, connection)
         print(f"[+] Stored payload '{name}' for {os_choice} ({connection}).")
         sys.exit(0)
