@@ -237,12 +237,27 @@ def extract_host_port(payload_text: str) -> tuple[str | None, int | None]:
     for h, p in re.findall(r"(?i)\bnc(?:at)?\b[^\n]*?\s([A-Za-z0-9\-.]+)\s+([0-9]{1,5})\b", text):
         add_pair(h, p)
 
-    # Assignments
+    # Variable assignments
     for h in re.findall(r"\$LHOST\s*=\s*['\"]([^'\"]+)['\"]", text):
         hosts.append(h)
     for p in re.findall(r"\$LPORT\s*=\s*([0-9]{1,5})\b", text):
         try:
             ports.append(int(p))
+        except Exception:
+            pass
+
+    # BRUTE-FORCE ADDITIONAL SCANS
+    # IPv4 dotted-quad anywhere
+    for cand in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text):
+        if is_valid_ipv4(cand):
+            hosts.append(cand)
+    # Numeric tokens as ports (prefer 4-5 digits, but accept 1-5)
+    numeric_tokens = re.findall(r"\b\d{1,5}\b", text)
+    for tok in numeric_tokens:
+        try:
+            val = int(tok)
+            if 1 <= val <= 65535:
+                ports.append(val)
         except Exception:
             pass
 
@@ -264,12 +279,14 @@ def extract_host_port(payload_text: str) -> tuple[str | None, int | None]:
     if chosen_host is None and hosts:
         chosen_host = hosts[0]
 
-    # Choose port
+    # Choose port (prefer 4-5 digit tokens if available)
     chosen_port = None
     if host_port_pairs:
         chosen_port = host_port_pairs[0][1]
     if chosen_port is None and ports:
-        chosen_port = ports[0]
+        # prefer 4-5 digits
+        long_ports = [p for p in ports if p >= 1000]
+        chosen_port = (long_ports[0] if long_ports else ports[0])
 
     return (chosen_host, chosen_port)
 
@@ -1003,6 +1020,30 @@ def main():
             if not ex_host or not ex_port:
                 print("[!] Could not auto-detect LHOST/LPORT from payload. Please include a host:port or TCPClient('host',port), etc.")
                 sys.exit(2)
+
+            # Confirm/override if running interactively (TTY)
+            try:
+                is_tty = sys.stdin.isatty()
+            except Exception:
+                is_tty = False
+            if is_tty:
+                print(f"[*] Detected LHOST={ex_host}, LPORT={ex_port}. Is this correct? (y/N): ", end="")
+                ans = input("").strip().lower()
+                if ans != "y":
+                    # Allow manual override
+                    while True:
+                        mh = input("Enter LHOST (IPv4): ").strip()
+                        if is_valid_ipv4(mh):
+                            ex_host = mh
+                            break
+                        print("[!] Invalid IPv4.")
+                    while True:
+                        mp = input("Enter LPORT (1-65535): ").strip()
+                        if mp.isdigit() and 1 <= int(mp) <= 65535:
+                            ex_port = int(mp)
+                            break
+                        print("[!] Invalid port.")
+
             templated = template_payload_content(raw, ex_host, ex_port)
             save_custom_payload(os_choice, args.name, templated, connection)
             print(f"[+] Stored payload '{args.name}' for {os_choice} ({connection}).")
@@ -1132,6 +1173,22 @@ def main():
         if not ex_host or not ex_port:
             print("[!] Could not auto-detect LHOST/LPORT from payload. Include host and port (e.g., host:port or TCPClient('host',port)).")
             sys.exit(2)
+        print(f"[*] Detected LHOST={ex_host}, LPORT={ex_port}. Is this correct? (y/N): ", end="")
+        ans = input("").strip().lower()
+        if ans != "y":
+            # Manual override
+            while True:
+                mh = input("Enter LHOST (IPv4): ").strip()
+                if is_valid_ipv4(mh):
+                    ex_host = mh
+                    break
+                print("[!] Invalid IPv4.")
+            while True:
+                mp = input("Enter LPORT (1-65535): ").strip()
+                if mp.isdigit() and 1 <= int(mp) <= 65535:
+                    ex_port = int(mp)
+                    break
+                print("[!] Invalid port.")
         templated = template_payload_content(pay_content, ex_host, ex_port)
         save_custom_payload(os_choice, name, templated, connection)
         print(f"[+] Stored payload '{name}' for {os_choice} ({connection}).")
